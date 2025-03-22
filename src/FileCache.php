@@ -18,6 +18,7 @@ use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Filesystem\FilesystemManager;
+use RuntimeException;
 use SplFileInfo;
 use Symfony\Component\Finder\Finder;
 
@@ -195,7 +196,14 @@ class FileCache implements FileCacheContract
 
         // Prune files by age.
         foreach ($files as $file) {
-            if ($now - $file->getATime() > $allowedAge && $this->delete($file)) {
+            try {
+                $aTime = $file->getATime();
+            } catch (RuntimeException $e) {
+                // This can happen if the file is deleted in the meantime.
+                continue;
+            }
+
+            if (($now - $aTime) > $allowedAge && $this->delete($file)) {
                 continue;
             }
 
