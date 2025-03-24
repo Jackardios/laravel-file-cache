@@ -4,6 +4,7 @@ namespace Biigle\FileCache;
 
 use Biigle\FileCache\Contracts\File;
 use Biigle\FileCache\Contracts\FileCache as FileCacheContract;
+use Biigle\FileCache\Exceptions\FailedToRetrieveFileException;
 use Biigle\FileCache\Exceptions\FileIsTooLargeException;
 use Biigle\FileCache\Exceptions\FileLockedException;
 use Biigle\FileCache\Exceptions\MimeTypeIsNotAllowedException;
@@ -35,9 +36,8 @@ class FileCache implements FileCacheContract
         protected ?Client $client = null,
         protected ?Filesystem $files = null,
         protected ?FilesystemManager $storage = null
-    )
-    {
-        $this->config = $this->prepareConfig(array_merge(config('file-cache'), $config));
+    ) {
+        $this->config = $this->prepareConfig($config);
         $this->client = $client ?: $this->makeHttpClient();
         $this->files = $files ?: app('files');
         $this->storage = $storage ?: app('filesystem');
@@ -51,22 +51,19 @@ class FileCache implements FileCacheContract
      */
     public function exists(File $file): bool
     {
-        if ($this->isRemote($file)) {
-            return $this->existsRemote($file);
-        }
-
-        return $this->existsDisk($file);
+        return $this->isRemote($file) ? $this->existsRemote($file) : $this->existsDisk($file);
     }
 
     /**
      * {@inheritdoc}
-     *
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
      * @throws SourceResourceIsInvalidException
      * @throws SourceResourceTimedOutException
      * @throws MimeTypeIsNotAllowedException
+     * @throws FileLockedException
+     * @throws FailedToRetrieveFileException
      */
     public function get(File $file, ?callable $callback = null, bool $throwOnLock = false)
     {
@@ -79,13 +76,14 @@ class FileCache implements FileCacheContract
 
     /**
      * {@inheritdoc}
-     *
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
      * @throws SourceResourceIsInvalidException
      * @throws SourceResourceTimedOutException
      * @throws MimeTypeIsNotAllowedException
+     * @throws FileLockedException
+     * @throws FailedToRetrieveFileException
      */
     public function getOnce(File $file, ?callable $callback = null, bool $throwOnLock = false)
     {
@@ -98,7 +96,6 @@ class FileCache implements FileCacheContract
 
     /**
      * {@inheritdoc}
-     *
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
@@ -106,33 +103,35 @@ class FileCache implements FileCacheContract
      * @throws SourceResourceTimedOutException
      * @throws MimeTypeIsNotAllowedException
      * @throws FileLockedException
+     * @throws FailedToRetrieveFileException
      */
     public function batch(array $files, ?callable $callback = null, bool $throwOnLock = false)
     {
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultBatchCallback']);
 
-        $retrieved = array_map(function ($file) use ($throwOnLock) {
-            return $this->retrieve($file, $throwOnLock);
-        }, $files);
-
-        $paths = array_map(static function ($file) {
-            return $file['path'];
-        }, $retrieved);
-
+        $retrieved = [];
         try {
-            $result = call_user_func($callback, $files, $paths);
+            $retrieved = array_map(function ($file) use ($throwOnLock) {
+                return $this->retrieve($file, $throwOnLock);
+            }, $files);
+
+            $paths = array_map(static function ($file) {
+                return $file['path'];
+            }, $retrieved);
+
+            return call_user_func($callback, $files, $paths);
         } finally {
+            // Ensure all streams are closed even if an exception occurs
             foreach ($retrieved as $file) {
-                fclose($file['stream']);
+                if (isset($file['stream']) && is_resource($file['stream'])) {
+                    fclose($file['stream']);
+                }
             }
         }
-
-        return $result;
     }
 
     /**
      * {@inheritdoc}
-     *
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
@@ -140,38 +139,46 @@ class FileCache implements FileCacheContract
      * @throws SourceResourceTimedOutException
      * @throws MimeTypeIsNotAllowedException
      * @throws FileLockedException
+     * @throws FailedToRetrieveFileException
      */
     public function batchOnce(array $files, ?callable $callback = null, bool $throwOnLock = false)
     {
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultBatchCallback']);
 
-        $retrieved = array_map(function ($file) use ($throwOnLock) {
-            return $this->retrieve($file, $throwOnLock);
-        }, $files);
-
-        $paths = array_map(static function ($file) {
-            return $file['path'];
-        }, $retrieved);
-
+        $retrieved = [];
         try {
+            $retrieved = array_map(function ($file) use ($throwOnLock) {
+                return $this->retrieve($file, $throwOnLock);
+            }, $files);
+
+            $paths = array_map(static function ($file) {
+                return $file['path'];
+            }, $retrieved);
+
             $result = call_user_func($callback, $files, $paths);
-        } finally {
+
+            // Delete processed files
             foreach ($retrieved as $index => $file) {
-                // Convert to exclusive lock for deletion. Don't delete if lock can't be
-                // obtained.
-                if (flock($file['stream'], LOCK_EX | LOCK_NB)) {
-                    // This path is not the same than $file['path'] for locally stored
-                    // files. We don't want to delete locally stored files.
+                // Try to obtain an exclusive lock with a non-blocking call
+                if (isset($file['stream'])
+                    && is_resource($file['stream'])
+                    && flock($file['stream'], LOCK_EX | LOCK_NB)) {
                     $path = $this->getCachedPath($files[$index]);
                     if ($this->files->exists($path)) {
                         $this->files->delete($path);
                     }
                 }
-                fclose($file['stream']);
+            }
+
+            return $result;
+        } finally {
+            // Ensure all streams are closed even if an exception occurs
+            foreach ($retrieved as $file) {
+                if (isset($file['stream']) && is_resource($file['stream'])) {
+                    fclose($file['stream']);
+                }
             }
         }
-
-        return $result;
     }
 
     /**
@@ -198,16 +205,16 @@ class FileCache implements FileCacheContract
         foreach ($files as $file) {
             try {
                 $aTime = $file->getATime();
+
+                if (($now - $aTime) > $allowedAge && $this->delete($file)) {
+                    continue;
+                }
+
+                $totalSize += $file->getSize();
             } catch (RuntimeException $e) {
-                // This can happen if the file is deleted in the meantime.
+                // File might have been deleted in the meantime, skip it
                 continue;
             }
-
-            if (($now - $aTime) > $allowedAge && $this->delete($file)) {
-                continue;
-            }
-
-            $totalSize += $file->getSize();
         }
 
         $allowedSize = $this->config['max_size'];
@@ -223,9 +230,13 @@ class FileCache implements FileCacheContract
                 ->getIterator();
 
             while ($totalSize > $allowedSize && ($file = $files->current())) {
-                $fileSize = $file->getSize();
-                if ($this->delete($file)) {
-                    $totalSize -= $fileSize;
+                try {
+                    $fileSize = $file->getSize();
+                    if ($this->delete($file)) {
+                        $totalSize -= $fileSize;
+                    }
+                } catch (RuntimeException $e) {
+                    // File might have been deleted in the meantime, skip it
                 }
                 $files->next();
             }
@@ -260,29 +271,37 @@ class FileCache implements FileCacheContract
      */
     protected function existsRemote(File $file): bool
     {
-        $response = $this->client->head($file->getUrl());
-        $code = $response->getStatusCode();
+        try {
+            $response = $this->client->head($this->encodeUrl($file->getUrl()), [
+                'timeout' => $this->config['timeout'],
+                'connect_timeout' => $this->config['connect_timeout'],
+            ]);
+            $code = $response->getStatusCode();
 
-        if ($code < 200 || $code >= 300) {
+            if ($code < 200 || $code >= 300) {
+                return false;
+            }
+
+            if (!empty($this->config['mime_types'])) {
+                $type = $response->getHeaderLine('content-type');
+                $type = trim(explode(';', $type)[0]);
+                if ($type && !in_array($type, $this->config['mime_types'], true)) {
+                    throw MimeTypeIsNotAllowedException::create($type);
+                }
+            }
+
+            $maxBytes = (int) $this->config['max_file_size'];
+            $size = (int) $response->getHeaderLine('content-length');
+
+            if ($maxBytes >= 0 && $size > $maxBytes) {
+                throw FileIsTooLargeException::create($maxBytes);
+            }
+
+            return true;
+        } catch (GuzzleException $e) {
+            // Consider the file as non-existent if HEAD request fails
             return false;
         }
-
-        if (!empty($this->config['mime_types'])) {
-            $type = $response->getHeaderLine('content-type');
-            $type = trim(explode(';', $type)[0]);
-            if ($type && !in_array($type, $this->config['mime_types'], true)) {
-                throw MimeTypeIsNotAllowedException::create($type);
-            }
-        }
-
-        $maxBytes = (int) $this->config['max_file_size'];
-        $size = (int) $response->getHeaderLine('content-length');
-
-        if ($maxBytes >= 0 && $size > $maxBytes) {
-            throw FileIsTooLargeException::create($maxBytes);
-        }
-
-        return true;
     }
 
     /**
@@ -293,15 +312,20 @@ class FileCache implements FileCacheContract
      */
     protected function existsDisk(File $file): bool
     {
-        $urlWithoutPort = $this->splitUrlByPort($file->getUrl())[1] ?? null;
-        $exists = $this->getDisk($file)->exists($urlWithoutPort);
+        $urlWithoutPort = $this->splitByProtocol($file->getUrl())[1] ?? null;
+        if ($urlWithoutPort === null) {
+            return false;
+        }
+
+        $disk = $this->getDisk($file);
+        $exists = $disk->exists($urlWithoutPort);
 
         if (!$exists) {
             return false;
         }
 
         if (!empty($this->config['mime_types'])) {
-            $type = $this->getDisk($file)->mimeType($urlWithoutPort);
+            $type = $disk->mimeType($urlWithoutPort);
             if (!in_array($type, $this->config['mime_types'], true)) {
                 throw MimeTypeIsNotAllowedException::create($type);
             }
@@ -310,7 +334,7 @@ class FileCache implements FileCacheContract
         $maxBytes = (int)$this->config['max_file_size'];
 
         if ($maxBytes >= 0) {
-            $size = $this->getDisk($file)->size($urlWithoutPort);
+            $size = $disk->size($urlWithoutPort);
             if ($size > $maxBytes) {
                 throw FileIsTooLargeException::create($maxBytes);
             }
@@ -328,17 +352,34 @@ class FileCache implements FileCacheContract
      */
     protected function delete(SplFileInfo $file): bool
     {
-        $fileStream = fopen($file->getRealPath(), 'rb');
+        // Check if file still exists before attempting to delete
+        if (!file_exists($file->getRealPath())) {
+            return false;
+        }
+
+        $fileStream = null;
         $deleted = false;
 
         try {
+            $fileStream = @fopen($file->getRealPath(), 'rb');
+            if ($fileStream === false) {
+                // Cannot open file, maybe it's already deleted
+                return false;
+            }
+
             // Only delete the file if it is not currently used. Else move on.
+            // Use non-blocking to avoid deadlocks
             if (flock($fileStream, LOCK_EX | LOCK_NB)) {
                 $this->files->delete($file->getRealPath());
                 $deleted = true;
             }
+        } catch (Exception $e) {
+            // Ignore exceptions when deleting cache files
+            return false;
         } finally {
-            fclose($fileStream);
+            if (is_resource($fileStream)) {
+                fclose($fileStream);
+            }
         }
 
         return $deleted;
@@ -351,7 +392,6 @@ class FileCache implements FileCacheContract
      *
      * @return array Containing the 'path' to the file and the file 'stream'. Close the
      * stream when finished.
-     *
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
@@ -359,65 +399,104 @@ class FileCache implements FileCacheContract
      * @throws SourceResourceTimedOutException
      * @throws MimeTypeIsNotAllowedException
      * @throws FileLockedException
+     * @throws FailedToRetrieveFileException
      */
     protected function retrieve(File $file, bool $throwOnLock = false): array
     {
         $this->ensurePathExists();
         $cachedPath = $this->getCachedPath($file);
+        $maxAttempts = 3;  // Prevent infinite loops
+        $attempt = 0;
 
-        // This will return false if the file already exists. Else it will create it in
-        // read and write mode.
-        $cachedFileStream = @fopen($cachedPath, 'xb+');
+        while ($attempt < $maxAttempts) {
+            $attempt++;
 
-        if ($cachedFileStream === false) {
-            // The file exists, get the file stream in read mode.
-            $cachedFileStream = fopen($cachedPath, 'rb');
+            // This will return false if the file already exists. Else it will create it in
+            // read and write mode.
+            $cachedFileStream = @fopen($cachedPath, 'xb+');
 
-            if ($throwOnLock && !flock($cachedFileStream, LOCK_SH | LOCK_NB)) {
-                throw new FileLockedException();
+            if ($cachedFileStream === false) {
+                // The file exists, try to get the file stream in read mode.
+                $cachedFileStream = @fopen($cachedPath, 'rb');
+
+                // If we can't open the file, it might be in a bad state or being deleted
+                if ($cachedFileStream === false) {
+                    // Wait a moment before retrying
+                    usleep(100000); // 100ms
+                    continue;
+                }
+
+                if ($throwOnLock && !flock($cachedFileStream, LOCK_SH | LOCK_NB)) {
+                    fclose($cachedFileStream);
+                    throw new FileLockedException();
+                }
+
+                // Wait for any LOCK_EX that is set if the file is currently written.
+                // Add timeout to prevent hanging
+                $lockAcquired = false;
+                $startTime = microtime(true);
+                $timeoutSec = 5; // 5 second timeout
+
+                while (!$lockAcquired && (microtime(true) - $startTime) < $timeoutSec) {
+                    $lockAcquired = flock($cachedFileStream, LOCK_SH | LOCK_NB);
+                    if (!$lockAcquired) {
+                        usleep(50000); // 50ms
+                    }
+                }
+
+                if (!$lockAcquired) {
+                    // Could not acquire lock in the given time
+                    fclose($cachedFileStream);
+                    // If timeout, try to remove the potentially corrupted file and retry
+                    @unlink($cachedPath);
+                    continue;
+                }
+
+                $stat = fstat($cachedFileStream);
+                // Check if the file is still there since the writing operation could have
+                // failed. If the file is gone, retry retrieve.
+                if ($stat['nlink'] === 0) {
+                    fclose($cachedFileStream);
+                    continue;
+                }
+
+                // File caching may have failed and left an empty file in the cache.
+                // Delete the empty file and try to cache the file again.
+                if ($stat['size'] === 0) {
+                    fclose($cachedFileStream);
+                    $this->delete(new SplFileInfo($cachedPath));
+                    continue;
+                }
+
+                // The file exists and is no longer written to.
+                return $this->retrieveExistingFile($cachedPath, $cachedFileStream);
             }
 
-            // Wait for any LOCK_EX that is set if the file is currently written.
-            flock($cachedFileStream, LOCK_SH);
-
-            $stat = fstat($cachedFileStream);
-            // Check if the file is still there since the writing operation could have
-            // failed. If the file is gone, retry retrieve.
-            if ($stat['nlink'] === 0) {
+            // The file did not exist and should be written. Hold LOCK_EX until writing
+            // finished.
+            if (!flock($cachedFileStream, LOCK_EX | LOCK_NB)) {
+                // Should not happen as we just created the file, but just in case
                 fclose($cachedFileStream);
-                return $this->retrieve($file);
+                @unlink($cachedPath);
+                continue;
             }
 
-            // File caching may have failed and left an empty file in the cache.
-            // Delete the empty file and try to cache the file again.
-            if ($stat['size'] === 0) {
+            try {
+                $fileInfo = $this->retrieveNewFile($file, $cachedPath, $cachedFileStream);
+                // Convert the lock so other workers can use the file from now on.
+                flock($cachedFileStream, LOCK_SH);
+                return $fileInfo;
+            } catch (Exception $exception) {
+                // Remove the empty file if writing failed. This is the case that is caught
+                // by 'nlink' === 0 above.
+                @unlink($cachedPath);
                 fclose($cachedFileStream);
-                $this->delete(new SplFileInfo($cachedPath));
-                return $this->retrieve($file);
-            }
 
-            // The file exists and is no longer written to.
-            return $this->retrieveExistingFile($cachedPath, $cachedFileStream);
+                throw $exception;
+            }
         }
 
-        // The file did not exist and should be written. Hold LOCK_EX until writing
-        // finished.
-        flock($cachedFileStream, LOCK_EX);
-
-        try {
-            $fileInfo = $this->retrieveNewFile($file, $cachedPath, $cachedFileStream);
-            // Convert the lock so other workers can use the file from now on.
-            flock($cachedFileStream, LOCK_SH);
-        } catch (Exception $exception) {
-            // Remove the empty file if writing failed. This is the case that is caught
-            // by 'nlink' === 0 above.
-            @unlink($cachedPath);
-            fclose($cachedFileStream);
-
-            throw $exception;
-        }
-
-        return $fileInfo;
+        throw new FailedToRetrieveFileException("Failed to retrieve file after {$maxAttempts} attempts");
     }
 
     /**
@@ -466,7 +545,7 @@ class FileCache implements FileCacheContract
             // If it is a locally stored file, delete the empty "placeholder"
             // file again. The stream may stay open; it doesn't matter.
             if ($newCachedPath !== $cachedPath) {
-                unlink($cachedPath);
+                @unlink($cachedPath);
             }
 
             $cachedPath = $newCachedPath;
@@ -503,10 +582,14 @@ class FileCache implements FileCacheContract
         $maxBytes = $this->config['max_file_size'];
         $isUnlimitedSize = $maxBytes === -1;
         $limitedTarget = new LimitStream(Utils::streamFor($target), $isUnlimitedSize ? -1 : $maxBytes + 1);
+
         $response = $this->client->get($this->encodeUrl($file->getUrl()), [
             'timeout' => $this->config['timeout'],
+            'connect_timeout' => $this->config['connect_timeout'],
+            'read_timeout' => $this->config['read_timeout'],
             'sink' => $limitedTarget,
         ]);
+
         $response->getBody()->detach();
 
         if (!$isUnlimitedSize && $limitedTarget->getSize() > $maxBytes) {
@@ -532,21 +615,28 @@ class FileCache implements FileCacheContract
      */
     protected function getDiskFile(File $file, $target): string
     {
-        $path = $this->splitUrlByPort($file->getUrl())[1] ?? null;
+        $parts = $this->splitByProtocol($file->getUrl());
+        if (!isset($parts[1])) {
+            throw new FileNotFoundException("Invalid file URL: {$file->getUrl()}");
+        }
+
+        $path = $parts[1];
         $disk = $this->getDisk($file);
 
         // Files from the local driver are not cached.
         $source = $disk->readStream($path);
         if (is_null($source)) {
-            throw new FileNotFoundException();
+            throw new FileNotFoundException("Could not open file stream for path: {$path}");
         }
 
-        $cachedPath = $this->cacheFromResource($file, $source, $target);
-        if (is_resource($source)) {
-            fclose($source);
+        try {
+            return $this->cacheFromResource($file, $source, $target);
+        } finally {
+            // Always close the source stream
+            if (is_resource($source)) {
+                fclose($source);
+            }
         }
-
-        return $cachedPath;
     }
 
     /**
@@ -571,14 +661,18 @@ class FileCache implements FileCacheContract
         $cachedPath = $this->getCachedPath($file);
         $maxBytes = $this->config['max_file_size'];
         $isUnlimitedSize = $maxBytes === -1;
+
+        // Set read timeout on source stream if possible
+        stream_set_timeout($source, (int)$this->config['read_timeout']);
+
         $bytes = stream_copy_to_stream($source, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
+
+        if ($bytes === false) {
+            throw SourceResourceIsInvalidException::create('Failed to copy stream data');
+        }
 
         if (!$isUnlimitedSize && $bytes > $maxBytes) {
             throw FileIsTooLargeException::create($maxBytes);
-        }
-
-        if ($bytes === false) {
-            throw SourceResourceIsInvalidException::create();
         }
 
         $metadata = stream_get_meta_data($source);
@@ -605,19 +699,41 @@ class FileCache implements FileCacheContract
      */
     protected function getDisk(File $file): \Illuminate\Contracts\Filesystem\Filesystem
     {
-        $diskName = $this->splitUrlByPort($file->getUrl())[0] ?? null;
+        $parts = $this->splitByProtocol($file->getUrl());
+        if (!isset($parts[0])) {
+            throw new RuntimeException("Invalid file URL format: {$file->getUrl()}");
+        }
 
+        $diskName = $parts[0];
         // Throws an exception if the disk does not exist.
         return $this->storage->disk($diskName);
     }
 
+    /**
+     * Prepare and validate configuration values.
+     */
     protected function prepareConfig(array $config): array
     {
+        $config = [
+            'max_file_size' => -1, // any size
+            'max_age' => 60, // 1 hour in minutes
+            'max_size' => 1E+9, // 1 GB
+            'timeout' => 0, // indefinitely
+            'connect_timeout' => 30.0, // 30 seconds
+            'read_timeout' => 30.0, // 30 seconds
+            'mime_types' => [],
+            'path' => storage_path('framework/cache/files'),
+            ...config('file-cache'),
+            ...$config,
+        ];
+
+        // Convert values to appropriate types
         $config['max_file_size'] = (int)$config['max_file_size'];
         $config['max_age'] = (int)$config['max_age'];
         $config['max_size'] = (int)$config['max_size'];
         $config['timeout'] = (float)$config['timeout'];
-        $config['mime_types'] = (array)($config['mime_types'] ?? []);
+        $config['connect_timeout'] = (float)$config['connect_timeout'];
+        $config['read_timeout'] = (float)$config['read_timeout'];
 
         return $config;
     }
@@ -634,17 +750,16 @@ class FileCache implements FileCacheContract
 
     /**
      * Determine if a file is remote, i.e. served by a public webserver.
-     *
-     * @param File $file
-     *
-     * @return boolean
      */
     protected function isRemote(File $file): bool
     {
         return str_starts_with($file->getUrl(), 'http');
     }
 
-    protected function splitUrlByPort(string $url): array
+    /**
+     * Split URL by protocol separator.
+     */
+    protected function splitByProtocol(string $url): array
     {
         return explode('://', $url, 2);
     }
@@ -663,11 +778,17 @@ class FileCache implements FileCacheContract
         return str_replace($pattern, $replacement, $url);
     }
 
+    /**
+     * Default callback for get() method.
+     */
     protected static function defaultGetCallback(File $file, string $path): string
     {
         return $path;
     }
 
+    /**
+     * Default callback for batch() method.
+     */
     protected static function defaultBatchCallback(array $files, array $paths): array
     {
         return $paths;
@@ -675,8 +796,6 @@ class FileCache implements FileCacheContract
 
     /**
      * Create a new Guzzle HTTP client.
-     *
-     * @return ClientInterface
      */
     protected function makeHttpClient(): ClientInterface
     {
