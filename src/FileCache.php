@@ -272,10 +272,7 @@ class FileCache implements FileCacheContract
     protected function existsRemote(File $file): bool
     {
         try {
-            $response = $this->client->head($this->encodeUrl($file->getUrl()), [
-                'timeout' => $this->config['timeout'],
-                'connect_timeout' => $this->config['connect_timeout'],
-            ]);
+            $response = $this->client->head($this->encodeUrl($file->getUrl()));
             $code = $response->getStatusCode();
 
             if ($code < 200 || $code >= 300) {
@@ -432,13 +429,16 @@ class FileCache implements FileCacheContract
                 }
 
                 // Wait for any LOCK_EX that is set if the file is currently written.
-                // Add timeout to prevent hanging
                 $lockAcquired = false;
                 $startTime = microtime(true);
-                $timeoutSec = 5; // 5 second timeout
 
-                while (!$lockAcquired && (microtime(true) - $startTime) < $timeoutSec) {
+                while (!$lockAcquired) {
                     $lockAcquired = flock($cachedFileStream, LOCK_SH | LOCK_NB);
+
+                    if ($this->config['timeout'] > 0 && (microtime(true) - $startTime) >= $this->config['timeout']) {
+                        break;
+                    }
+
                     if (!$lockAcquired) {
                         usleep(50000); // 50ms
                     }
@@ -447,8 +447,6 @@ class FileCache implements FileCacheContract
                 if (!$lockAcquired) {
                     // Could not acquire lock in the given time
                     fclose($cachedFileStream);
-                    // If timeout, try to remove the potentially corrupted file and retry
-                    @unlink($cachedPath);
                     continue;
                 }
 
@@ -584,9 +582,6 @@ class FileCache implements FileCacheContract
         $limitedTarget = new LimitStream(Utils::streamFor($target), $isUnlimitedSize ? -1 : $maxBytes + 1);
 
         $response = $this->client->get($this->encodeUrl($file->getUrl()), [
-            'timeout' => $this->config['timeout'],
-            'connect_timeout' => $this->config['connect_timeout'],
-            'read_timeout' => $this->config['read_timeout'],
             'sink' => $limitedTarget,
         ]);
 
