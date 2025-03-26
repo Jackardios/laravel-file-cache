@@ -1,6 +1,6 @@
 <?php
 
-namespace Biigle\FileCache\Exceptions;
+namespace Jackardios\FileCache\Exceptions;
 
 use Exception;
 

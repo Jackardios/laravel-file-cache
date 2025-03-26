@@ -1,8 +1,8 @@
 <?php
 
-namespace Biigle\FileCache;
+namespace Jackardios\FileCache;
 
-use Biigle\FileCache\Contracts\File;
+use Jackardios\FileCache\Contracts\File;
 
 class GenericFile implements File
 {

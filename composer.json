@@ -26,12 +26,12 @@
     ],
     "autoload": {
         "psr-4": {
-            "Biigle\\FileCache\\": "src"
+            "Jackardios\\FileCache\\": "src"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Biigle\\FileCache\\Tests\\": "tests/"
+            "Jackardios\\FileCache\\Tests\\": "tests/"
         },
         "classmap": [
             "tests/TestCase.php"
@@ -43,10 +43,10 @@
     "extra": {
         "laravel": {
             "providers": [
-                "Biigle\\FileCache\\FileCacheServiceProvider"
+                "Jackardios\\FileCache\\FileCacheServiceProvider"
             ],
             "aliases": {
-                "FileCache": "Biigle\\FileCache\\Facades\\FileCache"
+                "FileCache": "Jackardios\\FileCache\\Facades\\FileCache"
             }
         }
     }

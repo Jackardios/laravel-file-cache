@@ -1,6 +1,6 @@
 <?php
 
-namespace Biigle\FileCache\Listeners;
+namespace Jackardios\FileCache\Listeners;
 
 class ClearFileCache
 {

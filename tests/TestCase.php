@@ -1,8 +1,8 @@
 <?php
 
-namespace Biigle\FileCache\Tests;
+namespace Jackardios\FileCache\Tests;
 
-use Biigle\FileCache\FileCacheServiceProvider;
+use Jackardios\FileCache\FileCacheServiceProvider;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
 

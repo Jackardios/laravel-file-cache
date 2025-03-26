@@ -1,9 +1,9 @@
 <?php
 
-namespace Biigle\FileCache;
+namespace Jackardios\FileCache;
 
-use Biigle\FileCache\Console\Commands\PruneFileCache;
-use Biigle\FileCache\Listeners\ClearFileCache;
+use Jackardios\FileCache\Console\Commands\PruneFileCache;
+use Jackardios\FileCache\Listeners\ClearFileCache;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\ServiceProvider;

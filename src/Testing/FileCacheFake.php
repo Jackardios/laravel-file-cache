@@ -1,9 +1,9 @@
 <?php
 
-namespace Biigle\FileCache\Testing;
+namespace Jackardios\FileCache\Testing;
 
-use Biigle\FileCache\Contracts\File;
-use Biigle\FileCache\Contracts\FileCache as FileCacheContract;
+use Jackardios\FileCache\Contracts\File;
+use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
 use Illuminate\Filesystem\Filesystem;
 
 class FileCacheFake implements FileCacheContract

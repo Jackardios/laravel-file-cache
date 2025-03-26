@@ -1,8 +1,8 @@
 <?php
 
-namespace Biigle\FileCache\Console\Commands;
+namespace Jackardios\FileCache\Console\Commands;
 
-use Biigle\FileCache\FileCache;
+use Jackardios\FileCache\FileCache;
 use Illuminate\Console\Command;
 
 class PruneFileCache extends Command

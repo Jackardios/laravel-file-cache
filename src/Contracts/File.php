@@ -1,6 +1,6 @@
 <?php
 
-namespace Biigle\FileCache\Contracts;
+namespace Jackardios\FileCache\Contracts;
 
 interface File
 {

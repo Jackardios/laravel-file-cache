@@ -1,8 +1,8 @@
 <?php
 
-namespace Biigle\FileCache\Tests;
+namespace Jackardios\FileCache\Tests;
 
-use Biigle\FileCache\FileCache;
+use Jackardios\FileCache\FileCache;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Event;
 

@@ -1,8 +1,8 @@
 <?php
 
-namespace Biigle\FileCache\Tests\Listeners;
+namespace Jackardios\FileCache\Tests\Listeners;
 
-use Biigle\FileCache\Tests\TestCase;
+use Jackardios\FileCache\Tests\TestCase;
 
 class ClearFileCacheTest extends TestCase
 {

@@ -1,20 +1,20 @@
 <?php
 
-namespace Biigle\FileCache\Facades;
+namespace Jackardios\FileCache\Facades;
 
-use Biigle\FileCache\Testing\FileCacheFake;
+use Jackardios\FileCache\Testing\FileCacheFake;
 use Illuminate\Support\Facades\Facade;
 
 /**
- * @method static bool exists(\Biigle\FileCache\Contracts\File $file)
- * @method static mixed get(\Biigle\FileCache\Contracts\File $file, ?callable $callback = null)
- * @method static mixed getOnce(\Biigle\FileCache\Contracts\File $file, ?callable $callback = null)
- * @method static mixed batch(\Biigle\FileCache\Contracts\File[] $files, ?callable $callback = null)
- * @method static mixed batchOnce(\Biigle\FileCache\Contracts\File[] $files, ?callable $callback = null)
+ * @method static bool exists(\Jackardios\FileCache\Contracts\File $file)
+ * @method static mixed get(\Jackardios\FileCache\Contracts\File $file, ?callable $callback = null)
+ * @method static mixed getOnce(\Jackardios\FileCache\Contracts\File $file, ?callable $callback = null)
+ * @method static mixed batch(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null)
+ * @method static mixed batchOnce(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null)
  * @method static void prune()
  * @method static void clear()
  *
- * @see \Biigle\FileCache\FileCache;
+ * @see \Jackardios\FileCache\FileCache;
  */
 class FileCache extends Facade
 {

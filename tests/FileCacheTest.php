@@ -1,13 +1,13 @@
 <?php
 
-namespace Biigle\FileCache\Tests;
+namespace Jackardios\FileCache\Tests;
 
-use Biigle\FileCache\Contracts\File;
-use Biigle\FileCache\Exceptions\FileIsTooLargeException;
-use Biigle\FileCache\Exceptions\FileLockedException;
-use Biigle\FileCache\Exceptions\MimeTypeIsNotAllowedException;
-use Biigle\FileCache\FileCache;
-use Biigle\FileCache\GenericFile;
+use Jackardios\FileCache\Contracts\File;
+use Jackardios\FileCache\Exceptions\FileIsTooLargeException;
+use Jackardios\FileCache\Exceptions\FileLockedException;
+use Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException;
+use Jackardios\FileCache\FileCache;
+use Jackardios\FileCache\GenericFile;
 use Exception;
 use GuzzleHttp\Client;
 use GuzzleHttp\Handler\MockHandler;
@@ -16,9 +16,9 @@ use GuzzleHttp\Psr7\Response;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\FilesystemAdapter;
 use Illuminate\Filesystem\FilesystemManager;
-use Biigle\FileCache\Exceptions\FailedToRetrieveFileException;
-use Biigle\FileCache\Exceptions\SourceResourceIsInvalidException;
-use Biigle\FileCache\Exceptions\SourceResourceTimedOutException;
+use Jackardios\FileCache\Exceptions\FailedToRetrieveFileException;
+use Jackardios\FileCache\Exceptions\SourceResourceIsInvalidException;
+use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Psr7\Request;
 use phpmock\phpunit\PHPMock;
@@ -503,7 +503,7 @@ class FileCacheTest extends TestCase
         $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
         $this->app['filesystem'] = $filesystemManagerMock;
 
-        $streamGetMetaDataMock = $this->getFunctionMock('Biigle\\FileCache', 'stream_get_meta_data');
+        $streamGetMetaDataMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
         $streamGetMetaDataMock->expects($this->atLeastOnce())->willReturn(['timed_out' => true]);
 
         $cache = new FileCache([
@@ -538,7 +538,7 @@ class FileCacheTest extends TestCase
         $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
         $this->app['filesystem'] = $filesystemManagerMock;
 
-        $streamCopyMock = $this->getFunctionMock('Biigle\\FileCache', 'stream_copy_to_stream');
+        $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
         $streamCopyMock->expects($this->once())->willReturn(false);
 
         $cache = new FileCache(['path' => $this->cachePath]);
@@ -565,7 +565,7 @@ class FileCacheTest extends TestCase
         $this->assertTrue($this->app['filesystem']->disk('fixtures')->exists('test-file.txt'));
         touch($cachedPath);
         $this->assertFileExists($cachedPath);
-        $fopenMock = $this->getFunctionMock('Biigle\\FileCache', 'fopen');
+        $fopenMock = $this->getFunctionMock('Jackardios\\FileCache', 'fopen');
         $fopenMock->expects($this->atLeast(3)) // Expects >= 3 attempts fopen()
             ->willReturnCallback(function ($path, $mode) use ($cachedPath) {
                 if ($path === $cachedPath) {
@@ -583,7 +583,7 @@ class FileCacheTest extends TestCase
                 return \fopen($path, $mode);
             });
 
-        $usleepMock = $this->getFunctionMock('Biigle\\FileCache', 'usleep');
+        $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
         $usleepMock->expects($this->any());
 
         $cache = new FileCache(['path' => $this->cachePath]);

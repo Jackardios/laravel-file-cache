@@ -1,15 +1,15 @@
 <?php
 
-namespace Biigle\FileCache;
+namespace Jackardios\FileCache;
 
-use Biigle\FileCache\Contracts\File;
-use Biigle\FileCache\Contracts\FileCache as FileCacheContract;
-use Biigle\FileCache\Exceptions\FailedToRetrieveFileException;
-use Biigle\FileCache\Exceptions\FileIsTooLargeException;
-use Biigle\FileCache\Exceptions\FileLockedException;
-use Biigle\FileCache\Exceptions\MimeTypeIsNotAllowedException;
-use Biigle\FileCache\Exceptions\SourceResourceIsInvalidException;
-use Biigle\FileCache\Exceptions\SourceResourceTimedOutException;
+use Jackardios\FileCache\Contracts\File;
+use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
+use Jackardios\FileCache\Exceptions\FailedToRetrieveFileException;
+use Jackardios\FileCache\Exceptions\FileIsTooLargeException;
+use Jackardios\FileCache\Exceptions\FileLockedException;
+use Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException;
+use Jackardios\FileCache\Exceptions\SourceResourceIsInvalidException;
+use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
 use Exception;
 use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;

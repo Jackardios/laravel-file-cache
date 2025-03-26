@@ -17,33 +17,15 @@ composer require jackardios/laravel-file-cache
 
 The service provider and `FileCache` facade are auto-discovered by Laravel.
 
-### Lumen
-
-Add this to `bootstrap/app.php`:
-```php
-$app->register(Biigle\FileCache\FileCacheServiceProvider::class);
-$app->register(Illuminate\Filesystem\FilesystemServiceProvider::class);
-```
-
-To use the `FileCache` facade, enable `$app->withFacades()` and add the following to `bootstrap/app.php`:
-
-```php
-if (!class_exists(FileCache::class)) {
-    class_alias(Biigle\FileCache\Facades\FileCache::class, 'FileCache');
-}
-```
-
-Without facades, the file cache instance is available as `app('file-cache')`.
-
 ## Usage
 
 Take a look at the [`FileCache`](src/Contracts/FileCache.php) contract to see the public API of the file cache. Example:
 
 ```php
 use FileCache;
-use Biigle\FileCache\GenericFile;
+use Jackardios\FileCache\GenericFile;
 
-// Implements Biigle\FileCache\Contracts\File.
+// Implements Jackardios\FileCache\Contracts\File.
 $file = new GenericFile('https://example.com/images/image.jpg');
 
 FileCache::get($file, function ($file, $path) {
@@ -127,7 +109,7 @@ The `FileCache` facade provides a fake for easy testing. The fake does not actua
 
 ```php
 use FileCache;
-use Biigle\FileCache\GenericFile;
+use Jackardios\FileCache\GenericFile;
 
 FileCache::fake();
 $file = new GenericFile('https://example.com/image.jpg');

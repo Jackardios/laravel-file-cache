@@ -1,11 +1,11 @@
 <?php
 
-namespace Biigle\FileCache\Tests\Facades;
+namespace Jackardios\FileCache\Tests\Facades;
 
-use Biigle\FileCache\Facades\FileCache as FileCacheFacade;
-use Biigle\FileCache\FileCache as BaseFileCache;
-use Biigle\FileCache\GenericFile;
-use Biigle\FileCache\Tests\TestCase;
+use Jackardios\FileCache\Facades\FileCache as FileCacheFacade;
+use Jackardios\FileCache\FileCache as BaseFileCache;
+use Jackardios\FileCache\GenericFile;
+use Jackardios\FileCache\Tests\TestCase;
 use FileCache;
 
 class FileCacheTest extends TestCase

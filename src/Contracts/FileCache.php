@@ -1,6 +1,6 @@
 <?php
 
-namespace Biigle\FileCache\Contracts;
+namespace Jackardios\FileCache\Contracts;
 
 interface FileCache
 {
@@ -9,8 +9,8 @@ interface FileCache
      * locks on the cached file files, so it is not corrupted due to concurrent write
      * operations.
      *
-     * @param \Biigle\FileCache\Contracts\File $file
-     * @param (callable(\Biigle\FileCache\Contracts\File, string): mixed)|null $callback Gets the file object and the path to the cached file
+     * @param \Jackardios\FileCache\Contracts\File $file
+     * @param (callable(\Jackardios\FileCache\Contracts\File, string): mixed)|null $callback Gets the file object and the path to the cached file
      * file as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
@@ -22,8 +22,8 @@ interface FileCache
      * Like `get` but deletes the cached file afterwards (if it is not used somewhere
      * else).
      *
-     * @param \Biigle\FileCache\Contracts\File $file
-     * @param (callable(\Biigle\FileCache\Contracts\File, string): mixed)|null $callback Gets the file object and the path to the cached file
+     * @param \Jackardios\FileCache\Contracts\File $file
+     * @param (callable(\Jackardios\FileCache\Contracts\File, string): mixed)|null $callback Gets the file object and the path to the cached file
      * file as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
@@ -35,8 +35,8 @@ interface FileCache
      * Perform a callback with the paths of many cached files. Use this to prevent
      * pruning of the files while they are processed.
      *
-     * @param \Biigle\FileCache\Contracts\File[] $files
-     * @param (callable(\Biigle\FileCache\Contracts\File[], string[]): mixed)|null $callback Gets the array of file objects and the array of paths
+     * @param \Jackardios\FileCache\Contracts\File[] $files
+     * @param (callable(\Jackardios\FileCache\Contracts\File[], string[]): mixed)|null $callback Gets the array of file objects and the array of paths
      * to the cached file files (in the same ordering) as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
@@ -48,8 +48,8 @@ interface FileCache
      * Like `batch` but deletes the cached files afterwards (if they are not used
      * somewhere else).
      *
-     * @param \Biigle\FileCache\Contracts\File[] $files
-     * @param (callable(\Biigle\FileCache\Contracts\File[], string[]): mixed)|null $callback Gets the array of file objects and the array of paths
+     * @param \Jackardios\FileCache\Contracts\File[] $files
+     * @param (callable(\Jackardios\FileCache\Contracts\File[], string[]): mixed)|null $callback Gets the array of file objects and the array of paths
      * to the cached file files (in the same ordering) as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
@@ -70,7 +70,7 @@ interface FileCache
     /**
      * Check if a file exists.
      *
-     * @param \Biigle\FileCache\Contracts\File $file
+     * @param \Jackardios\FileCache\Contracts\File $file
      *
      * @return bool Whether the file exists or not.
      */
