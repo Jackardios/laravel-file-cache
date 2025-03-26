@@ -321,20 +321,25 @@ class FileCache implements FileCacheContract
             return false;
         }
 
-        if (!empty($this->config['mime_types'])) {
-            $type = $disk->mimeType($urlWithoutPort);
-            if (!in_array($type, $this->config['mime_types'], true)) {
-                throw MimeTypeIsNotAllowedException::create($type);
+        try {
+            if (!empty($this->config['mime_types'])) {
+                $type = $disk->mimeType($urlWithoutPort);
+                if (!in_array($type, $this->config['mime_types'], true)) {
+                    throw MimeTypeIsNotAllowedException::create($type);
+                }
             }
-        }
 
-        $maxBytes = (int)$this->config['max_file_size'];
+            $maxBytes = (int)$this->config['max_file_size'];
 
-        if ($maxBytes >= 0) {
-            $size = $disk->size($urlWithoutPort);
-            if ($size > $maxBytes) {
-                throw FileIsTooLargeException::create($maxBytes);
+            if ($maxBytes >= 0) {
+                $size = $disk->size($urlWithoutPort);
+                if ($size > $maxBytes) {
+                    throw FileIsTooLargeException::create($maxBytes);
+                }
             }
+        } catch (FileNotFoundException $e) {
+            // if file deleted in the meantime
+            return false;
         }
 
         return true;
