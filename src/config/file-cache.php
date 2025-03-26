@@ -25,7 +25,7 @@ return [
 
     /*
      | Total connection timeout when reading remote files in seconds. If
-     | loading the file takes longer than this, it will fail.
+     | loading the file takes longer than this, it will fail. Set to 0 to wait indefinitely.
      | Default: 0 (indefinitely)
      */
     'timeout' => env('FILE_CACHE_TIMEOUT', 0),
