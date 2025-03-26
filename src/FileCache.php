@@ -425,7 +425,7 @@ class FileCache implements FileCacheContract
 
                 if ($throwOnLock && !flock($cachedFileStream, LOCK_SH | LOCK_NB)) {
                     fclose($cachedFileStream);
-                    throw new FileLockedException();
+                    throw FileLockedException::create();
                 }
 
                 // Wait for any LOCK_EX that is set if the file is currently written.
@@ -487,14 +487,14 @@ class FileCache implements FileCacheContract
             } catch (Exception $exception) {
                 // Remove the empty file if writing failed. This is the case that is caught
                 // by 'nlink' === 0 above.
-                @unlink($cachedPath);
                 fclose($cachedFileStream);
+                @unlink($cachedPath);
 
                 throw $exception;
             }
         }
 
-        throw new FailedToRetrieveFileException("Failed to retrieve file after {$maxAttempts} attempts");
+        throw FailedToRetrieveFileException::create("Failed to retrieve file after {$maxAttempts} attempts");
     }
 
     /**
