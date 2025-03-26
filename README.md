@@ -5,7 +5,7 @@ Fetch and cache files from local filesystem, cloud storage or public webservers 
 
 The file cache is specifically designed for use in concurrent processing with multiple parallel queue workers.
 
-[![Tests](https://github.com/biigle/laravel-file-cache/actions/workflows/tests.yml/badge.svg)](https://github.com/biigle/laravel-file-cache/actions/workflows/tests.yml)
+[![Tests](https://github.com/jackardios/laravel-file-cache/actions/workflows/tests.yml/badge.svg)](https://github.com/jackardios/laravel-file-cache/actions/workflows/tests.yml)
 
 ## Installation
 
@@ -86,10 +86,24 @@ Directory to use for the file cache.
 
 ### file-cache.timeout
 
-Default: `5.0`
+Default: `0` (indefinitely)
 Environment: `FILE_CACHE_TIMEOUT`
 
-Read timeout in seconds for fetching remote files. If the stream transmits no data for longer than this period (or cannot be established), caching the file fails.
+Total connection timeout when reading remote files in seconds. If loading the file takes longer than this, it will fail. Set to 0 to wait indefinitely.. Set to `0` to wait indefinitely.
+
+### file-cache.connect_timeout
+
+Default: `30` (30 seconds)
+Environment: `FILE_CACHE_CONNECT_TIMEOUT`
+
+Timeout to initiate a connection to load a remote file in seconds. If it takes longer, it will fail. Set to 0 to wait indefinitely.. Set to `0` to wait indefinitely.
+
+### file-cache.read_timeout
+
+Default: `30` (30 seconds)
+Environment: `FILE_CACHE_READ_TIMEOUT`
+
+Timeout for reading a stream of a remote file in seconds. If it takes longer, it will fail. Set to -1 to wait indefinitely.
 
 ### file-cache.prune_interval
 
