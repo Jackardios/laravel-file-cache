@@ -97,7 +97,7 @@ class FileCacheTest extends TestCase
 
         $this->assertFileDoesNotExist($cachedPath);
         $path = $cache->get($file, $this->noop);
-        $this->assertEquals("{$this->cachePath}/{$hash}", $path);
+        $this->assertEquals($cachedPath, $path);
 
         $this->assertFileExists($cachedPath);
     }
@@ -721,61 +721,165 @@ class FileCacheTest extends TestCase
         $this->assertTrue($this->app['files']->delete($cachedPath));
     }
 
-    public function testNonEmptyPartialFileIsDeletedOnGuzzleHandlerError()
+    public function testGetWaitsForLockReleaseWhenNotThrowing()
     {
-        $fileUrl = 'https://files.example.com/partial-download-handler.xyz';
-        $file = new GenericFile($fileUrl);
-        $hash = hash('sha256', $fileUrl);
+        $file = new GenericFile('fixtures://test-file.txt');
+        $hash = hash('sha256', 'fixtures://test-file.txt');
         $cachedPath = "{$this->cachePath}/{$hash}";
-        $partialContent = "This data was written before the simulated timeout.";
-        $errorMessage = 'Simulated RequestException after partial write.';
 
-        $this->assertFileDoesNotExist($cachedPath);
+        // Simulate: Another process started recording and set LOCK_EX
+        // Create a file manually to simulate the start of recording
+        $this->assertTrue(touch($cachedPath), "Failed to create cache file for locking.");
+        $writingProcessHandle = fopen($cachedPath, 'rb+');
+        $this->assertIsResource($writingProcessHandle, "Failed to open handle for writing process simulation.");
+        $this->assertTrue(flock($writingProcessHandle, LOCK_EX), "Failed to acquire LOCK_EX for writing simulation.");
 
-        $customHandler = $this->createPartialDownloadHandler($partialContent, $errorMessage);
-        $handlerStack = HandlerStack::create($customHandler);
-        $mockClient = new Client(['handler' => $handlerStack]);
-        $cache = new FileCache(['path' => $this->cachePath], $mockClient);
+        // Set up a mock for flock in the class under test:
+        // - The first few attempts to get LOCK_SH | LOCK_NB should return false.
+        // - Then one attempt should return true (simulating the removal of LOCK_EX).
+        $flockMock = $this->getFunctionMock('Jackardios\\FileCache', 'flock');
+        $lockAttempt = 0;
+        $maxAttemptsBeforeSuccess = 3;
+        $sharedLockHandle = null;
 
-        try {
-            $cache->get($file, $this->noop);
+        $flockMock->expects($this->atLeast($maxAttemptsBeforeSuccess + 1))
+            ->willReturnCallback(
+                function ($handle, $operation) use (&$lockAttempt, $maxAttemptsBeforeSuccess, &$writingProcessHandle, $cachedPath, &$sharedLockHandle) {
+                    $meta = stream_get_meta_data($handle);
+                    if ($meta['uri'] === $cachedPath && $meta['mode'] === 'rb') {
+                        $sharedLockHandle = $handle;
+                    }
 
-            $this->fail('Expected GuzzleHttp\Exception\RequestException was not thrown.');
-        } catch (RequestException $e) {
-            $this->assertEquals($errorMessage, $e->getMessage());
-        } finally {
-            $this->assertFileDoesNotExist(
-                $cachedPath,
-                "NON-EMPTY partial cache file [$cachedPath] created via handler should have been deleted after error."
+                    // Only interested in trying to get LOCK_SH without waiting
+                    if ($handle === $sharedLockHandle && ($operation === (LOCK_SH | LOCK_NB) || $operation === LOCK_SH)) {
+                        $lockAttempt++;
+                        if ($lockAttempt <= $maxAttemptsBeforeSuccess) {
+                            // Simulate that the file is still exclusively locked
+                            return false;
+                        } else {
+                            // Simulate that exclusive lock is released
+                            // Release real lock so that subsequent fstat etc. work
+                            if (is_resource($writingProcessHandle)) {
+                                \flock($writingProcessHandle, LOCK_UN);
+                                fclose($writingProcessHandle);
+                                $writingProcessHandle = null;
+                            }
+
+                            return \flock($handle, $operation); // Use real flock to set LOCK_SH
+                        }
+                    }
+
+                    // For all other flock calls (e.g. initial LOCK_EX, LOCK_UN) - actual behavior
+                    return \flock($handle, $operation);
+                }
             );
+
+        // Mock usleep to make sure the wait happens
+        $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
+        $usleepMock->expects($this->exactly($maxAttemptsBeforeSuccess));
+
+        $cache = new FileCache(['path' => $this->cachePath]);
+        $resultPath = $cache->get($file, $this->noop, false); // $throwOnLock = false
+
+        $this->assertEquals($cachedPath, $resultPath);
+        $this->assertFileExists($cachedPath);
+        $this->assertGreaterThanOrEqual($maxAttemptsBeforeSuccess, $lockAttempt, "LOCK_SH should have been attempted multiple times.");
+        $this->assertGreaterThan(0, filesize($cachedPath), "Cached file should not be empty after successful retrieval.");
+
+        // Cleanup (if $writingProcessHandle was not closed in mock)
+        if (is_resource($writingProcessHandle)) {
+            \flock($writingProcessHandle, LOCK_UN);
+            fclose($writingProcessHandle);
         }
     }
 
-    private function createPartialDownloadHandler(string $partialContent, string $errorMessage): callable
+    public function testMultipleReadersAccessCachedFileSimultaneously()
     {
-        return function (RequestInterface $request, array $options) use ($partialContent, $errorMessage): PromiseInterface {
-            if (!isset($options['sink']) || !is_resource($options['sink'])) {
-                return new RejectedPromise(
-                    new \InvalidArgumentException('The "sink" option (stream resource) is required by the mock handler.')
-                );
+        $file = new GenericFile('fixtures://test-file.txt');
+        $hash = hash('sha256', 'fixtures://test-file.txt');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
+        $cache = new FileCache(['path' => $this->cachePath]);
+        $initialPath = $cache->get($file, $this->noop);
+        $this->assertEquals($cachedPath, $initialPath);
+        $this->assertFileExists($cachedPath);
+
+        // Simulate the first reader holding LOCK_SH
+        $reader1Handle = fopen($cachedPath, 'rb');
+        $this->assertTrue(flock($reader1Handle, LOCK_SH), "Reader 1 failed to acquire LOCK_SH.");
+
+        // The second reader tries to get the file (must successfully get LOCK_SH)
+        $reader2Path = null;
+        $reader2Handle = null;
+        try {
+            $reader2Path = $cache->get($file, function($file, $path) use (&$reader2Handle) {
+                // Let's try to open and block inside a callback to make sure it's possible
+                $reader2Handle = fopen($path, 'rb');
+                $this->assertTrue(flock($reader2Handle, LOCK_SH), "Reader 2 failed to acquire LOCK_SH while Reader 1 held lock.");
+                return $path;
+            });
+        } catch (\Exception $e) {
+            // Release the first reader's lock in case of error
+            flock($reader1Handle, LOCK_UN);
+            fclose($reader1Handle);
+            if (is_resource($reader2Handle)) fclose($reader2Handle);
+            $this->fail("Reader 2 failed to get cached file while Reader 1 held LOCK_SH: " . $e->getMessage());
+        }
+
+        $this->assertEquals($cachedPath, $reader2Path);
+        $this->assertIsResource($reader2Handle, "Reader 2 handle should be a resource.");
+
+        flock($reader1Handle, LOCK_UN);
+        fclose($reader1Handle);
+        flock($reader2Handle, LOCK_UN);
+        fclose($reader2Handle);
+    }
+
+    public function testGetRemotePartialDownloadTimeout()
+    {
+        $fileUrl = 'https://files.example.com/large-file.zip';
+        $file = new GenericFile($fileUrl);
+        $hash = hash('sha256', $fileUrl);
+        $cachedPath = "{$this->cachePath}/{$hash}";
+        $partialContent = 'some partial data';
+        $readTimeout = 0.1;
+
+        $mockResponse = new Response(200, ['Content-Type' => 'application/zip']);
+        $mock = new MockHandler([$mockResponse]);
+        $client = new Client(['handler' => HandlerStack::create($mock)]);
+
+        $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
+        $streamCopyMock->expects($this->once())
+        ->willReturnCallback(function ($source, $dest, $maxLength) use ($partialContent) {
+            fwrite($dest, $partialContent);
+            // Simulate that copying was interrupted (returned false)
+            return false;
+        });
+
+        // 3. Мок stream_get_meta_data
+        // Must be called AFTER stream_copy_to_stream fails
+        $streamMetaMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
+        // Can be called multiple times (in cacheFromResource and in getRemoteFile)
+        $streamMetaMock->expects($this->atLeastOnce())
+            ->willReturn(['timed_out' => true]); // simulate timeout
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'read_timeout' => $readTimeout,
+        ], $client);
+
+        $this->expectException(SourceResourceTimedOutException::class);
+
+        try {
+            $cache->get($file, $this->noop);
+        } catch (SourceResourceTimedOutException $e) {
+            clearstatcache(true, $cachedPath);
+            $this->assertFileDoesNotExist($cachedPath, "Partially downloaded file should have been deleted after timeout.");
+            throw $e;
+        } finally {
+            if (file_exists($cachedPath)) {
+                unlink($cachedPath);
             }
-
-            $stream = $options['sink'];
-
-            try {
-                $bytesWritten = fwrite($stream, $partialContent);
-                if ($bytesWritten === false) {
-                    return new RejectedPromise(new RequestException('Mock handler failed to write to sink.', $request));
-                }
-                fflush($stream);
-
-                $exception = new RequestException($errorMessage, $request);
-
-                return new RejectedPromise($exception);
-
-            } catch (\Throwable $e) {
-                return new RejectedPromise(new RequestException('Exception during mock handler execution: '.$e->getMessage(), $request, null, $e));
-            }
-        };
+        }
     }
 }
