@@ -431,7 +431,7 @@ class FileCache implements FileCacheContract
                 while (!$lockAcquired) {
                     $lockAcquired = flock($cachedFileStream, LOCK_SH | LOCK_NB);
 
-                    if ($this->config['timeout'] > 0 && (microtime(true) - $startTime) >= $this->config['timeout']) {
+                    if ($this->config['lock_wait_timeout'] > 0 && (microtime(true) - $startTime) >= $this->config['lock_wait_timeout']) {
                         break;
                     }
 
@@ -730,6 +730,7 @@ class FileCache implements FileCacheContract
             'max_age' => 60, // 1 hour in minutes
             'max_size' => 1E+9, // 1 GB
             'timeout' => 0, // indefinitely
+            'lock_wait_timeout' => 0, // indefinitely
             'connect_timeout' => 30.0, // 30 seconds
             'read_timeout' => 30.0, // 30 seconds
             'mime_types' => [],
@@ -743,6 +744,7 @@ class FileCache implements FileCacheContract
         $config['max_age'] = (int)$config['max_age'];
         $config['max_size'] = (int)$config['max_size'];
         $config['timeout'] = (float)$config['timeout'];
+        $config['lock_wait_timeout'] = (float)$config['lock_wait_timeout'];
         $config['connect_timeout'] = (float)$config['connect_timeout'];
         $config['read_timeout'] = (float)$config['read_timeout'];
 
