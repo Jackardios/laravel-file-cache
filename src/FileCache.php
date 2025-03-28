@@ -2,6 +2,7 @@
 
 namespace Jackardios\FileCache;
 
+use GuzzleHttp\Exception\RequestException;
 use Jackardios\FileCache\Contracts\File;
 use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
 use Jackardios\FileCache\Exceptions\FailedToRetrieveFileException;
@@ -14,11 +15,10 @@ use Exception;
 use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\GuzzleException;
-use GuzzleHttp\Psr7\LimitStream;
-use GuzzleHttp\Psr7\Utils;
 use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Filesystem\FilesystemManager;
+use Psr\Http\Message\ResponseInterface;
 use RuntimeException;
 use SplFileInfo;
 use Symfony\Component\Finder\Finder;
@@ -271,34 +271,30 @@ class FileCache implements FileCacheContract
      */
     protected function existsRemote(File $file): bool
     {
-        try {
-            $response = $this->client->head($this->encodeUrl($file->getUrl()));
-            $code = $response->getStatusCode();
+        $response = $this->client->head($this->encodeUrl($file->getUrl()));
+        $code = $response->getStatusCode();
 
-            if ($code < 200 || $code >= 300) {
-                return false;
-            }
-
-            if (!empty($this->config['mime_types'])) {
-                $type = $response->getHeaderLine('content-type');
-                $type = trim(explode(';', $type)[0]);
-                if ($type && !in_array($type, $this->config['mime_types'], true)) {
-                    throw MimeTypeIsNotAllowedException::create($type);
-                }
-            }
-
-            $maxBytes = (int) $this->config['max_file_size'];
-            $size = (int) $response->getHeaderLine('content-length');
-
-            if ($maxBytes >= 0 && $size > $maxBytes) {
-                throw FileIsTooLargeException::create($maxBytes);
-            }
-
-            return true;
-        } catch (GuzzleException $e) {
-            // Consider the file as non-existent if HEAD request fails
+        if ($code < 200 || $code >= 300) {
             return false;
         }
+
+        if (!empty($this->config['mime_types'])) {
+            $type = $response->getHeaderLine('content-type');
+            $type = trim(explode(';', $type)[0]);
+            if ($type && !in_array($type, $this->config['mime_types'], true)) {
+                throw MimeTypeIsNotAllowedException::create($type);
+            }
+        }
+
+        $maxBytes = $this->config['max_file_size'];
+        $contentLength = $response->getHeaderLine('content-length');
+        $contentBytes = is_numeric($contentLength) ? (int) $contentLength : null;
+
+        if ($maxBytes >= 0 && $contentBytes !== null && $contentBytes > $maxBytes) {
+            throw FileIsTooLargeException::create($maxBytes);
+        }
+
+        return true;
     }
 
     /**
@@ -309,37 +305,32 @@ class FileCache implements FileCacheContract
      */
     protected function existsDisk(File $file): bool
     {
-        $urlWithoutPort = $this->splitByProtocol($file->getUrl())[1] ?? null;
-        if ($urlWithoutPort === null) {
+        $urlWithoutProtocol = $this->splitByProtocol($file->getUrl())[1] ?? null;
+        if ($urlWithoutProtocol === null) {
             return false;
         }
 
         $disk = $this->getDisk($file);
-        $exists = $disk->exists($urlWithoutPort);
+        $exists = $disk->exists($urlWithoutProtocol);
 
         if (!$exists) {
             return false;
         }
 
-        try {
-            if (!empty($this->config['mime_types'])) {
-                $type = $disk->mimeType($urlWithoutPort);
-                if (!in_array($type, $this->config['mime_types'], true)) {
-                    throw MimeTypeIsNotAllowedException::create($type);
-                }
+        if (!empty($this->config['mime_types'])) {
+            $type = $disk->mimeType($urlWithoutProtocol);
+            if (!in_array($type, $this->config['mime_types'], true)) {
+                throw MimeTypeIsNotAllowedException::create($type);
             }
+        }
 
-            $maxBytes = (int)$this->config['max_file_size'];
+        $maxBytes = $this->config['max_file_size'];
 
-            if ($maxBytes >= 0) {
-                $size = $disk->size($urlWithoutPort);
-                if ($size > $maxBytes) {
-                    throw FileIsTooLargeException::create($maxBytes);
-                }
+        if ($maxBytes >= 0) {
+            $size = $disk->size($urlWithoutProtocol);
+            if ($size > $maxBytes) {
+                throw FileIsTooLargeException::create($maxBytes);
             }
-        } catch (FileNotFoundException $e) {
-            // if file deleted in the meantime
-            return false;
         }
 
         return true;
@@ -489,7 +480,7 @@ class FileCache implements FileCacheContract
                 // Convert the lock so other workers can use the file from now on.
                 flock($cachedFileStream, LOCK_SH);
                 return $fileInfo;
-            } catch (Exception $exception) {
+            } catch (\Throwable $exception) {
                 // Remove the empty file if writing failed. This is the case that is caught
                 // by 'nlink' === 0 above.
                 fclose($cachedFileStream);
@@ -583,17 +574,37 @@ class FileCache implements FileCacheContract
         $cachedPath = $this->getCachedPath($file);
 
         $maxBytes = $this->config['max_file_size'];
-        $isUnlimitedSize = $maxBytes === -1;
-        $limitedTarget = new LimitStream(Utils::streamFor($target), $isUnlimitedSize ? -1 : $maxBytes + 1);
+        $isUnlimitedSize = $maxBytes < 0;
 
-        $response = $this->client->get($this->encodeUrl($file->getUrl()), [
-            'sink' => $limitedTarget,
-        ]);
+        try {
+            $this->client->get($this->encodeUrl($file->getUrl()), [
+                'sink' => $target,
+                'on_headers' => function ($response) use ($maxBytes, $isUnlimitedSize) {
+                    if (! $response instanceof ResponseInterface) {
+                        return;
+                    }
+                    $contentLength = $response->getHeaderLine('content-length');
+                    $contentBytes = is_numeric($contentLength) ? (int) $contentLength : null;
 
-        $response->getBody()->detach();
-
-        if (!$isUnlimitedSize && $limitedTarget->getSize() > $maxBytes) {
-            throw FileIsTooLargeException::create($maxBytes);
+                    if (!$isUnlimitedSize && $contentBytes !== null && $contentBytes > $maxBytes) {
+                        throw FileIsTooLargeException::create($maxBytes);
+                    }
+                },
+                'progress' => function (
+                    $downloadTotalBytes,
+                    $downloadedBytes
+                ) use ($maxBytes) {
+                    if ($downloadedBytes > $maxBytes) {
+                        throw FileIsTooLargeException::create($maxBytes);
+                    }
+                }
+            ]);
+        } catch (RequestException $exception) {
+            $previous = $exception->getPrevious();
+            if ($previous instanceof FileIsTooLargeException) {
+                throw $previous;
+            }
+            throw $exception;
         }
 
         return $cachedPath;
@@ -660,10 +671,10 @@ class FileCache implements FileCacheContract
 
         $cachedPath = $this->getCachedPath($file);
         $maxBytes = $this->config['max_file_size'];
-        $isUnlimitedSize = $maxBytes === -1;
+        $isUnlimitedSize = $maxBytes < 0;
 
         // Set read timeout on source stream if possible
-        stream_set_timeout($source, (int)$this->config['read_timeout']);
+        stream_set_timeout($source, $this->config['read_timeout']);
 
         $bytes = stream_copy_to_stream($source, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
 
