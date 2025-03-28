@@ -2,6 +2,9 @@
 
 namespace Jackardios\FileCache\Tests;
 
+use GuzzleHttp\Exception\RequestException;
+use GuzzleHttp\Promise\PromiseInterface;
+use GuzzleHttp\Promise\RejectedPromise;
 use Jackardios\FileCache\Contracts\File;
 use Jackardios\FileCache\Exceptions\FileIsTooLargeException;
 use Jackardios\FileCache\Exceptions\FileLockedException;
@@ -22,6 +25,7 @@ use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Psr7\Request;
 use phpmock\phpunit\PHPMock;
+use Psr\Http\Message\RequestInterface;
 use ReflectionMethod;
 
 /**
@@ -66,41 +70,46 @@ class FileCacheTest extends TestCase
         $cache = new FileCache(['path' => $this->cachePath]);
         $file = new GenericFile('abc://some/image.jpg');
         $hash = hash('sha256', 'abc://some/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
 
-        $path = "{$this->cachePath}/{$hash}";
-        copy(__DIR__.'/files/test-image.jpg', $path);
-        $this->assertTrue(touch($path, time() - 1));
-        $fileatime = fileatime($path);
+        copy(__DIR__.'/files/test-image.jpg', $cachedPath);
+        $this->assertTrue(touch($cachedPath, time() - 1));
+        $fileatime = fileatime($cachedPath);
         $this->assertNotEquals(time(), $fileatime);
         $file = $cache->get($file, function ($file, $path) {
             return $file;
         });
         $this->assertInstanceof(File::class, $file);
         clearstatcache();
-        $this->assertNotEquals($fileatime, fileatime($path));
+        $this->assertNotEquals($fileatime, fileatime($cachedPath));
     }
 
     public function testGetRemote()
     {
         $file = new GenericFile('https://files/image.jpg');
         $hash = hash('sha256', 'https://files/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
         $mock = new MockHandler([
             new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
         ]);
         $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
 
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $this->assertFileDoesNotExist($cachedPath);
         $path = $cache->get($file, $this->noop);
         $this->assertEquals("{$this->cachePath}/{$hash}", $path);
-        $this->assertTrue($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+
+        $this->assertFileExists($cachedPath);
     }
 
     public function testGetRemoteTooLarge()
     {
         $file = new GenericFile('https://files/image.jpg');
         $hash = hash('sha256', 'https://files/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
         $mock = new MockHandler([
-            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+            new Response(200, ['Content-Length' => 100], file_get_contents(__DIR__.'/files/test-image.jpg')),
         ]);
         $cache = new FileCache([
             'path' => $this->cachePath,
@@ -109,7 +118,7 @@ class FileCacheTest extends TestCase
 
         $this->expectException(FileIsTooLargeException::class);
         $cache->get($file, $this->noop);
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $this->assertFileDoesNotExist($cachedPath);
     }
 
     public function testGetDiskDoesNotExist()
@@ -130,10 +139,12 @@ class FileCacheTest extends TestCase
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
         $file = new GenericFile('test://test-image.jpg');
         $hash = hash('sha256', 'test://test-image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
         $cache = new FileCache(['path' => $this->cachePath]);
 
         $path = $cache->get($file, $this->noop);
-        $this->assertEquals("{$this->cachePath}/{$hash}", $path);
+        $this->assertEquals($cachedPath, $path);
+        $this->assertFileExists($cachedPath);
     }
 
     public function testGetDiskLocalDoesNotExist()
@@ -150,6 +161,7 @@ class FileCacheTest extends TestCase
         config(['filesystems.disks.s3' => ['driver' => 's3']]);
         $file = new GenericFile('s3://files/test-image.jpg');
         $hash = hash('sha256', 's3://files/test-image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
 
         $stream = fopen(__DIR__.'/files/test-image.jpg', 'rb');
         $filesystemManagerMock = $this->createMock(FilesystemManager::class);
@@ -162,10 +174,10 @@ class FileCacheTest extends TestCase
 
         $cache = new FileCache(['path' => $this->cachePath]);
 
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $this->assertFileDoesNotExist($cachedPath);
         $path = $cache->get($file, $this->noop);
-        $this->assertEquals("{$this->cachePath}/{$hash}", $path);
-        $this->assertTrue($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $this->assertEquals($cachedPath, $path);
+        $this->assertFileExists($cachedPath);
         $this->assertFalse(is_resource($stream));
     }
 
@@ -174,6 +186,7 @@ class FileCacheTest extends TestCase
         config(['filesystems.disks.s3' => ['driver' => 's3']]);
         $file = new GenericFile('s3://files/test-image.jpg');
         $hash = hash('sha256', 's3://files/test-image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
 
         $stream = fopen(__DIR__.'/files/test-image.jpg', 'rb');
 
@@ -190,9 +203,9 @@ class FileCacheTest extends TestCase
             'max_file_size' => 1,
         ]);
 
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
         $this->expectException(FileIsTooLargeException::class);
         $cache->get($file, $this->noop);
+        $this->assertFileDoesNotExist($cachedPath);
     }
 
     public function testGetThrowOnLock()
@@ -216,27 +229,29 @@ class FileCacheTest extends TestCase
         $file = new GenericFile('fixtures://test-file.txt');
         $hash = hash('sha256', 'fixtures://test-file.txt');
 
-        $path = "{$this->cachePath}/{$hash}";
-        touch($path);
-        $this->assertEquals(0, filesize($path));
+        $cachedPath = "{$this->cachePath}/{$hash}";
+        touch($cachedPath);
+        $this->assertEquals(0, filesize($cachedPath));
 
-        $file = $cache->get($file, function ($file, $path) {
+         $cache->get($file, function ($file, $path) {
             return $file;
         });
 
-        $this->assertNotEquals(0, filesize($path));
+        $this->assertNotEquals(0, filesize($cachedPath));
     }
 
     public function testGetOnce()
     {
         $file = new GenericFile('fixtures://test-image.jpg');
         $hash = hash('sha256', 'fixtures://test-image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
         $cache = new FileCache(['path' => $this->cachePath]);
         $file = $cache->getOnce($file, function ($file, $path) {
             return $file;
         });
         $this->assertInstanceof(File::class, $file);
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $this->assertFileDoesNotExist($cachedPath);
     }
 
     public function testBatch()
@@ -438,7 +453,7 @@ class FileCacheTest extends TestCase
         $file = new GenericFile('https://example.com/file');
         $cache = new FileCache([
             'path' => $this->cachePath,
-            'max_file_size' => 50,
+            'max_file_size' => 1,
         ], client: $client);
 
         $this->expectException(FileIsTooLargeException::class);
@@ -468,23 +483,43 @@ class FileCacheTest extends TestCase
         }
     }
 
-    public function testGetRemoteThrowsGuzzleExceptionOnGetRequest()
+    public function testExistsRemoteTimeout()
+    {
+        $file = new GenericFile('https://files.example.com/image.jpg');
+        $request = new Request('HEAD', $file->getUrl());
+        $connectException = new ConnectException('Example of connection failed', $request);
+
+        $mock = new MockHandler([
+            $connectException,
+        ]);
+        $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
+
+        try {
+            $cache->exists($file);
+            $this->fail('Expected an ConnectException to be thrown.');
+        } catch (ConnectException $e) {
+            $this->assertEquals('Example of connection failed', $e->getMessage());
+        }
+    }
+
+    public function testGetRemoteThrowsConnectExceptionOnGetRequest()
     {
         $file = new GenericFile('https://files.example.com/image.jpg');
         $hash = hash('sha256', 'https://files.example.com/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
         $request = new Request('GET', $file->getUrl());
-        $connectException = new ConnectException('Connection failed', $request);
+        $connectException = new ConnectException('Example of connection failed', $request);
 
         $mock = new MockHandler([$connectException]);
         $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
 
-        $this->expectException(ConnectException::class); // Ожидаем исходное исключение Guzzle
-
         try {
             $cache->get($file, $this->noop);
+            $this->fail('Expected an ConnectException to be thrown.');
+        } catch (ConnectException $e) {
+            $this->assertEquals('Example of connection failed', $e->getMessage());
         } finally {
-            // Убедимся, что временный файл не остался (если он был создан)
-            $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+            $this->assertFileDoesNotExist($cachedPath);
         }
     }
 
@@ -662,20 +697,6 @@ class FileCacheTest extends TestCase
         ];
     }
 
-    public function testExistsRemoteReturnsFalseOnGuzzleException()
-    {
-        $file = new GenericFile('https://files.example.com/image.jpg');
-        $request = new Request('HEAD', $file->getUrl());
-        $connectException = new ConnectException('Connection failed', $request);
-
-        $mock = new MockHandler([
-            $connectException,
-        ]);
-        $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
-
-        $this->assertFalse($cache->exists($file));
-    }
-
     public function testGetOnceDoesNotDeleteLockedFile()
     {
         $file = new GenericFile('fixtures://test-image.jpg');
@@ -691,12 +712,70 @@ class FileCacheTest extends TestCase
         });
 
         $this->assertEquals($cachedPath, $result);
-        $this->assertTrue($this->app['files']->exists($cachedPath));
+        $this->assertFileExists($cachedPath);
         $this->assertNotNull($handle);
 
         flock($handle, LOCK_UN);
         fclose($handle);
 
         $this->assertTrue($this->app['files']->delete($cachedPath));
+    }
+
+    public function testNonEmptyPartialFileIsDeletedOnGuzzleHandlerError()
+    {
+        $fileUrl = 'https://files.example.com/partial-download-handler.xyz';
+        $file = new GenericFile($fileUrl);
+        $hash = hash('sha256', $fileUrl);
+        $cachedPath = "{$this->cachePath}/{$hash}";
+        $partialContent = "This data was written before the simulated timeout.";
+        $errorMessage = 'Simulated RequestException after partial write.';
+
+        $this->assertFileDoesNotExist($cachedPath);
+
+        $customHandler = $this->createPartialDownloadHandler($partialContent, $errorMessage);
+        $handlerStack = HandlerStack::create($customHandler);
+        $mockClient = new Client(['handler' => $handlerStack]);
+        $cache = new FileCache(['path' => $this->cachePath], $mockClient);
+
+        try {
+            $cache->get($file, $this->noop);
+
+            $this->fail('Expected GuzzleHttp\Exception\RequestException was not thrown.');
+        } catch (RequestException $e) {
+            $this->assertEquals($errorMessage, $e->getMessage());
+        } finally {
+            $this->assertFileDoesNotExist(
+                $cachedPath,
+                "NON-EMPTY partial cache file [$cachedPath] created via handler should have been deleted after error."
+            );
+        }
+    }
+
+    private function createPartialDownloadHandler(string $partialContent, string $errorMessage): callable
+    {
+        return function (RequestInterface $request, array $options) use ($partialContent, $errorMessage): PromiseInterface {
+            if (!isset($options['sink']) || !is_resource($options['sink'])) {
+                return new RejectedPromise(
+                    new \InvalidArgumentException('The "sink" option (stream resource) is required by the mock handler.')
+                );
+            }
+
+            $stream = $options['sink'];
+
+            try {
+                $bytesWritten = fwrite($stream, $partialContent);
+                if ($bytesWritten === false) {
+                    return new RejectedPromise(new RequestException('Mock handler failed to write to sink.', $request));
+                }
+                fflush($stream);
+
+                $exception = new RequestException($errorMessage, $request);
+
+                return new RejectedPromise($exception);
+
+            } catch (\Throwable $e) {
+                return new RejectedPromise(new RequestException('Exception during mock handler execution: '.$e->getMessage(), $request, null, $e));
+            }
+        };
     }
 }
