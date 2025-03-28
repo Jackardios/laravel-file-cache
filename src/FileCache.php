@@ -567,6 +567,8 @@ class FileCache implements FileCacheContract
      *
      * @throws GuzzleException
      * @throws FileIsTooLargeException
+     * @throws SourceResourceTimedOutException
+     * @throws SourceResourceIsInvalidException
      */
     protected function getRemoteFile(File $file, $target): string
     {
@@ -575,9 +577,11 @@ class FileCache implements FileCacheContract
         $maxBytes = $this->config['max_file_size'];
         $isUnlimitedSize = $maxBytes < 0;
 
+        $sourceResource = null;
+
         try {
-            $this->client->get($this->encodeUrl($file->getUrl()), [
-                'sink' => $target,
+            $response = $this->client->get($this->encodeUrl($file->getUrl()), [
+                'stream' => true,
                 'on_headers' => function ($response) use ($maxBytes, $isUnlimitedSize) {
                     if (! $response instanceof ResponseInterface) {
                         return;
@@ -589,24 +593,47 @@ class FileCache implements FileCacheContract
                         throw FileIsTooLargeException::create($maxBytes);
                     }
                 },
-                'progress' => function (
-                    $downloadTotalBytes,
-                    $downloadedBytes
-                ) use ($maxBytes, $isUnlimitedSize) {
-                    if (!$isUnlimitedSize && $downloadedBytes > $maxBytes) {
-                        throw FileIsTooLargeException::create($maxBytes);
-                    }
-                }
             ]);
+            $responseBodyStream = $response->getBody();
+            $sourceResource = $responseBodyStream->detach();
+
+            if (!is_resource($sourceResource)) {
+                throw SourceResourceIsInvalidException::create('Could not detach valid stream resource from response body.');
+            }
+
+            stream_set_timeout($sourceResource, $this->config['read_timeout']);
+            $bytes = stream_copy_to_stream($sourceResource, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
+
+            if ($bytes === false) {
+                $metadata = stream_get_meta_data($sourceResource);
+                if (isset($metadata['timed_out']) && $metadata['timed_out']) {
+                    throw SourceResourceTimedOutException::create();
+                }
+                throw SourceResourceIsInvalidException::create('Failed to copy stream data from remote source.');
+            }
+
+            if (!$isUnlimitedSize && $bytes > $maxBytes) {
+                throw FileIsTooLargeException::create($maxBytes);
+            }
+
+            $metadata = stream_get_meta_data($sourceResource);
+            if (isset($metadata['timed_out']) && $metadata['timed_out']) {
+                throw SourceResourceTimedOutException::create();
+            }
+
+            return $cachedPath;
+
         } catch (RequestException $exception) {
             $previous = $exception->getPrevious();
             if ($previous instanceof FileIsTooLargeException) {
                 throw $previous;
             }
             throw $exception;
+        } finally {
+            if (is_resource($sourceResource)) {
+                fclose($sourceResource);
+            }
         }
-
-        return $cachedPath;
     }
 
     /**
@@ -672,7 +699,6 @@ class FileCache implements FileCacheContract
         $maxBytes = $this->config['max_file_size'];
         $isUnlimitedSize = $maxBytes < 0;
 
-        // Set read timeout on source stream if possible
         stream_set_timeout($source, $this->config['read_timeout']);
 
         $bytes = stream_copy_to_stream($source, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
