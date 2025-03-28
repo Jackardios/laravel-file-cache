@@ -18,6 +18,7 @@ class GenericFile implements File
     {
         $this->url = $url;
     }
+
     /**
      * {@inheritdoc}
      */

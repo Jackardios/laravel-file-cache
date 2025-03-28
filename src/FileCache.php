@@ -593,8 +593,8 @@ class FileCache implements FileCacheContract
                 'progress' => function (
                     $downloadTotalBytes,
                     $downloadedBytes
-                ) use ($maxBytes) {
-                    if ($downloadedBytes > $maxBytes) {
+                ) use ($maxBytes, $isUnlimitedSize) {
+                    if (!$isUnlimitedSize && $downloadedBytes > $maxBytes) {
                         throw FileIsTooLargeException::create($maxBytes);
                     }
                 }
