@@ -24,17 +24,23 @@ return [
     'path' => storage_path('framework/cache/files'),
 
     /*
-     | Total connection timeout when reading remote files in seconds. If
-     | loading the file takes longer than this, it will fail. Set to 0 to wait indefinitely.
-     | Default: 0 (indefinitely)
+     | Maximum number of attempts to set a lock on a file
+     | Default: 3
      */
-    'timeout' => env('FILE_CACHE_TIMEOUT', 0),
+    'lock_max_attempts' => env('FILE_CACHE_LOCK_MAX_ATTEMPTS', 3),
 
     /*
      | Timeout to wait for a lock on a file to be released in seconds.
      | Default: 0 (indefinitely)
      */
     'lock_wait_timeout' => env('FILE_CACHE_LOCK_WAIT_TIMEOUT', 0),
+
+    /*
+     | Total connection timeout when reading remote files in seconds. If
+     | loading the file takes longer than this, it will fail. Set to 0 to wait indefinitely.
+     | Default: 0 (indefinitely)
+     */
+    'timeout' => env('FILE_CACHE_TIMEOUT', 0),
 
     /*
      | Timeout to initiate a connection to load a remote file in seconds. If

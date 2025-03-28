@@ -398,10 +398,9 @@ class FileCache implements FileCacheContract
     {
         $this->ensurePathExists();
         $cachedPath = $this->getCachedPath($file);
-        $maxAttempts = 3;  // Prevent infinite loops
         $attempt = 0;
 
-        while ($attempt < $maxAttempts) {
+        while ($attempt < $this->config['lock_max_attempts']) {
             $attempt++;
 
             // This will return false if the file already exists. Else it will create it in
@@ -490,7 +489,7 @@ class FileCache implements FileCacheContract
             }
         }
 
-        throw FailedToRetrieveFileException::create("Failed to retrieve file after {$maxAttempts} attempts");
+        throw FailedToRetrieveFileException::create("Failed to retrieve file after {$this->config['lock_max_attempts']} attempts");
     }
 
     /**
@@ -725,17 +724,19 @@ class FileCache implements FileCacheContract
      */
     protected function prepareConfig(array $config): array
     {
+        $fileCacheConfig = config('file-cache', []);
         $config = [
             'max_file_size' => -1, // any size
             'max_age' => 60, // 1 hour in minutes
             'max_size' => 1E+9, // 1 GB
-            'timeout' => 0, // indefinitely
+            'lock_max_attempts' => 3, // 3 attempts
             'lock_wait_timeout' => 0, // indefinitely
+            'timeout' => 0, // indefinitely
             'connect_timeout' => 30.0, // 30 seconds
             'read_timeout' => 30.0, // 30 seconds
             'mime_types' => [],
             'path' => storage_path('framework/cache/files'),
-            ...config('file-cache'),
+            ...(is_array($fileCacheConfig) ? $fileCacheConfig : []),
             ...$config,
         ];
 
@@ -743,8 +744,9 @@ class FileCache implements FileCacheContract
         $config['max_file_size'] = (int)$config['max_file_size'];
         $config['max_age'] = (int)$config['max_age'];
         $config['max_size'] = (int)$config['max_size'];
-        $config['timeout'] = (float)$config['timeout'];
+        $config['lock_max_attempts'] = max((int)$config['lock_max_attempts'], 1);
         $config['lock_wait_timeout'] = (float)$config['lock_wait_timeout'];
+        $config['timeout'] = (float)$config['timeout'];
         $config['connect_timeout'] = (float)$config['connect_timeout'];
         $config['read_timeout'] = (float)$config['read_timeout'];
 
