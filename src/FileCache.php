@@ -327,9 +327,6 @@ class FileCache implements FileCacheContract
         }
 
         $stats['total_size'] = $totalSize;
-        $stats['remaining'] = count($remainingFiles) - ($stats['deleted'] - (count($fileInfos) - count($remainingFiles)));
-
-        // Recalculate remaining properly
         $stats['remaining'] = 0;
         foreach ($remainingFiles as $info) {
             if ($this->files->exists($info['file']->getRealPath())) {
