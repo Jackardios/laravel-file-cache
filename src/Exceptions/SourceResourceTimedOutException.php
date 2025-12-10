@@ -3,11 +3,12 @@
 namespace Jackardios\FileCache\Exceptions;
 
 use Exception;
+use Throwable;
 
 class SourceResourceTimedOutException extends Exception
 {
-    public static function create(?string $message = null): self
+    public static function create(?string $message = null, int $code = 0, ?Throwable $previous = null): self
     {
-        return new self($message ?? 'The source stream timed out while reading data.');
+        return new self($message ?? 'The source stream timed out while reading data.', $code, $previous);
     }
 }
