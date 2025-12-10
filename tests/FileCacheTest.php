@@ -2,12 +2,10 @@
 
 namespace Jackardios\FileCache\Tests;
 
-use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Promise\PromiseInterface;
-use GuzzleHttp\Promise\RejectedPromise;
 use Jackardios\FileCache\Contracts\File;
 use Jackardios\FileCache\Exceptions\FileIsTooLargeException;
 use Jackardios\FileCache\Exceptions\FileLockedException;
+use Jackardios\FileCache\Exceptions\InvalidConfigurationException;
 use Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException;
 use Jackardios\FileCache\FileCache;
 use Jackardios\FileCache\GenericFile;
@@ -36,14 +34,17 @@ class FileCacheTest extends TestCase
 {
     use PHPMock;
 
+    protected string $cachePath;
+    protected string $diskPath;
+    protected \Closure $noop;
+
     public function setUp(): void
     {
         parent::setUp();
         $this->cachePath = sys_get_temp_dir().'/biigle_file_cache_test';
         $this->diskPath = sys_get_temp_dir().'/biigle_file_cache_disk';
-        $this->noop = function ($file, $path) {
-            return $path;
-        };
+        $this->noop = fn ($file, $path) => $path;
+
         $this->app['files']->makeDirectory($this->cachePath, 0755, false, true);
         $this->app['files']->makeDirectory($this->diskPath, 0755, false, true);
 
@@ -65,56 +66,103 @@ class FileCacheTest extends TestCase
         parent::tearDown();
     }
 
+    /**
+     * Create a FileCache instance with default path.
+     */
+    protected function createCache(array $config = []): FileCache
+    {
+        return new FileCache(array_merge(['path' => $this->cachePath], $config));
+    }
+
+    /**
+     * Create a FileCache with a mock HTTP client.
+     */
+    protected function createCacheWithMockClient(array $responses, array $config = []): FileCache
+    {
+        $mock = new MockHandler($responses);
+        $client = new Client([
+            'handler' => HandlerStack::create($mock),
+            'http_errors' => false,
+        ]);
+        return new FileCache(array_merge(['path' => $this->cachePath], $config), $client);
+    }
+
+    /**
+     * Get the cached path for a file URL.
+     */
+    protected function getCachedPath(string $url): string
+    {
+        return "{$this->cachePath}/" . hash('sha256', $url);
+    }
+
+    /**
+     * Create a mock S3 filesystem.
+     */
+    protected function mockS3Filesystem($stream): void
+    {
+        config(['filesystems.disks.s3' => ['driver' => 's3']]);
+
+        $filesystemManagerMock = $this->createMock(FilesystemManager::class);
+        $filesystemMock = $this->createMock(FilesystemAdapter::class);
+        $filesystemMock->method('readStream')->willReturn($stream);
+        $filesystemMock->method('getDriver')->willReturn($filesystemMock);
+        $filesystemMock->method('get')->willReturn($filesystemMock);
+        $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
+        $this->app['filesystem'] = $filesystemManagerMock;
+    }
+
+    /**
+     * Get test image content.
+     */
+    protected function getTestImageContent(): string
+    {
+        return file_get_contents(__DIR__.'/files/test-image.jpg');
+    }
+
     public function testGetExists()
     {
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $file = new GenericFile('abc://some/image.jpg');
-        $hash = hash('sha256', 'abc://some/image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $cache = $this->createCache();
+        $url = 'abc://some/image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
         copy(__DIR__.'/files/test-image.jpg', $cachedPath);
         $this->assertTrue(touch($cachedPath, time() - 1));
         $fileatime = fileatime($cachedPath);
         $this->assertNotEquals(time(), $fileatime);
-        $file = $cache->get($file, function ($file, $path) {
-            return $file;
-        });
-        $this->assertInstanceof(File::class, $file);
+
+        $result = $cache->get($file, fn ($file, $path) => $file);
+
+        $this->assertInstanceof(File::class, $result);
         clearstatcache();
         $this->assertNotEquals($fileatime, fileatime($cachedPath));
     }
 
     public function testGetRemote()
     {
-        $file = new GenericFile('https://files/image.jpg');
-        $hash = hash('sha256', 'https://files/image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'https://files/image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $mock = new MockHandler([
-            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+        $cache = $this->createCacheWithMockClient([
+            new Response(200, [], $this->getTestImageContent()),
         ]);
-        $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
 
         $this->assertFileDoesNotExist($cachedPath);
         $path = $cache->get($file, $this->noop);
         $this->assertEquals($cachedPath, $path);
-
         $this->assertFileExists($cachedPath);
     }
 
     public function testGetRemoteTooLarge()
     {
-        $file = new GenericFile('https://files/image.jpg');
-        $hash = hash('sha256', 'https://files/image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'https://files/image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $mock = new MockHandler([
-            new Response(200, ['Content-Length' => 100], file_get_contents(__DIR__.'/files/test-image.jpg')),
-        ]);
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_file_size' => 1,
-        ], new Client(['handler' => HandlerStack::create($mock)]));
+        $cache = $this->createCacheWithMockClient([
+            new Response(200, ['Content-Length' => 100], $this->getTestImageContent()),
+        ], ['max_file_size' => 1]);
 
         $this->expectException(FileIsTooLargeException::class);
         $cache->get($file, $this->noop);
@@ -124,23 +172,20 @@ class FileCacheTest extends TestCase
     public function testGetDiskDoesNotExist()
     {
         $file = new GenericFile('abc://files/image.jpg');
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
-        try {
-            $cache->get($file, $this->noop);
-            $this->fail('Expected an Exception to be thrown.');
-        } catch (Exception $e) {
-            $this->assertStringContainsString("Disk [abc] does not have a configured driver", $e->getMessage());
-        }
+        $this->expectException(Exception::class);
+        $this->expectExceptionMessage("Disk [abc] does not have a configured driver");
+        $cache->get($file, $this->noop);
     }
 
     public function testGetDiskLocal()
     {
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
-        $file = new GenericFile('test://test-image.jpg');
-        $hash = hash('sha256', 'test://test-image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $url = 'test://test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+        $cache = $this->createCache();
 
         $path = $cache->get($file, $this->noop);
         $this->assertEquals($cachedPath, $path);
@@ -150,7 +195,7 @@ class FileCacheTest extends TestCase
     public function testGetDiskLocalDoesNotExist()
     {
         $file = new GenericFile('test://test-image.jpg');
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
         $this->expectException(FileNotFoundException::class);
         $cache->get($file, $this->noop);
@@ -158,21 +203,14 @@ class FileCacheTest extends TestCase
 
     public function testGetDiskCloud()
     {
-        config(['filesystems.disks.s3' => ['driver' => 's3']]);
-        $file = new GenericFile('s3://files/test-image.jpg');
-        $hash = hash('sha256', 's3://files/test-image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 's3://files/test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
         $stream = fopen(__DIR__.'/files/test-image.jpg', 'rb');
-        $filesystemManagerMock = $this->createMock(FilesystemManager::class);
-        $filesystemMock = $this->createMock(FilesystemAdapter::class);
-        $filesystemMock->method('readStream')->willReturn($stream);
-        $filesystemMock->method('getDriver')->willReturn($filesystemMock);
-        $filesystemMock->method('get')->willReturn($filesystemMock);
-        $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
-        $this->app['filesystem'] = $filesystemManagerMock;
+        $this->mockS3Filesystem($stream);
 
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
         $this->assertFileDoesNotExist($cachedPath);
         $path = $cache->get($file, $this->noop);
@@ -183,25 +221,14 @@ class FileCacheTest extends TestCase
 
     public function testGetDiskCloudTooLarge()
     {
-        config(['filesystems.disks.s3' => ['driver' => 's3']]);
-        $file = new GenericFile('s3://files/test-image.jpg');
-        $hash = hash('sha256', 's3://files/test-image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 's3://files/test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
         $stream = fopen(__DIR__.'/files/test-image.jpg', 'rb');
+        $this->mockS3Filesystem($stream);
 
-        $filesystemManagerMock = $this->createMock(FilesystemManager::class);
-        $filesystemMock = $this->createMock(FilesystemAdapter::class);
-        $filesystemMock->method('readStream')->willReturn($stream);
-        $filesystemMock->method('getDriver')->willReturn($filesystemMock);
-        $filesystemMock->method('get')->willReturn($filesystemMock);
-        $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
-        $this->app['filesystem'] = $filesystemManagerMock;
-
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_file_size' => 1,
-        ]);
+        $cache = $this->createCache(['max_file_size' => 1]);
 
         $this->expectException(FileIsTooLargeException::class);
         $cache->get($file, $this->noop);
@@ -210,61 +237,64 @@ class FileCacheTest extends TestCase
 
     public function testGetThrowOnLock()
     {
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $file = new GenericFile('abc://some/image.jpg');
-        $hash = hash('sha256', 'abc://some/image.jpg');
-        $path = "{$this->cachePath}/{$hash}";
+        $cache = $this->createCache();
+        $url = 'abc://some/image.jpg';
+        $file = new GenericFile($url);
+        $path = $this->getCachedPath($url);
         touch($path, time() - 1);
 
         $handle = fopen($path, 'w');
         flock($handle, LOCK_EX);
 
-        $this->expectException(FileLockedException::class);
-        $cache->get($file, fn ($file, $path) => $file, true);
+        try {
+            $this->expectException(FileLockedException::class);
+            $cache->get($file, fn ($file, $path) => $file, true);
+        } finally {
+            if (is_resource($handle)) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+        }
     }
 
     public function testGetIgnoreZeroSize()
     {
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $file = new GenericFile('fixtures://test-file.txt');
-        $hash = hash('sha256', 'fixtures://test-file.txt');
+        $cache = $this->createCache();
+        $url = 'fixtures://test-file.txt';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $cachedPath = "{$this->cachePath}/{$hash}";
         touch($cachedPath);
         $this->assertEquals(0, filesize($cachedPath));
 
-         $cache->get($file, function ($file, $path) {
-            return $file;
-        });
+        $cache->get($file, fn ($file, $path) => $file);
 
         $this->assertNotEquals(0, filesize($cachedPath));
     }
 
     public function testGetOnce()
     {
-        $file = new GenericFile('fixtures://test-image.jpg');
-        $hash = hash('sha256', 'fixtures://test-image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'fixtures://test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $file = $cache->getOnce($file, function ($file, $path) {
-            return $file;
-        });
-        $this->assertInstanceof(File::class, $file);
+        $cache = $this->createCache();
+        $result = $cache->getOnce($file, fn ($file, $path) => $file);
+
+        $this->assertInstanceof(File::class, $result);
         $this->assertFileDoesNotExist($cachedPath);
     }
 
     public function testBatch()
     {
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
-        $file = new GenericFile('test://test-image.jpg');
-        $file2 = new GenericFile('test://test-image.jpg');
-        $hash = hash('sha256', 'test://test-image.jpg');
+        $url = 'test://test-image.jpg';
+        $file = new GenericFile($url);
+        $file2 = new GenericFile($url);
+        $hash = hash('sha256', $url);
 
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $paths = $cache->batch([$file, $file2], function ($files, $paths) {
-            return $paths;
-        });
+        $cache = $this->createCache();
+        $paths = $cache->batch([$file, $file2], fn ($files, $paths) => $paths);
 
         $this->assertCount(2, $paths);
         $this->assertStringContainsString($hash, $paths[0]);
@@ -273,25 +303,35 @@ class FileCacheTest extends TestCase
 
     public function testBatchThrowOnLock()
     {
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $file = new GenericFile('abc://some/image.jpg');
-        $hash = hash('sha256', 'abc://some/image.jpg');
-        $path = "{$this->cachePath}/{$hash}";
+        $cache = $this->createCache();
+        $url = 'abc://some/image.jpg';
+        $file = new GenericFile($url);
+        $path = $this->getCachedPath($url);
         touch($path, time() - 1);
 
         $handle = fopen($path, 'w');
         flock($handle, LOCK_EX);
 
-        $this->expectException(FileLockedException::class);
-        $cache->batch([$file], fn ($file, $path) => $file, true);
+        try {
+            $this->expectException(FileLockedException::class);
+            $cache->batch([$file], fn ($file, $path) => $file, true);
+        } finally {
+            if (is_resource($handle)) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+        }
     }
 
     public function testBatchOnce()
     {
-        $file = new GenericFile('fixtures://test-image.jpg');
-        $hash = hash('sha256', 'fixtures://test-image.jpg');
-        (new FileCache(['path' => $this->cachePath]))->batchOnce([$file], $this->noop);
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+        $url = 'fixtures://test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+
+        $this->createCache()->batchOnce([$file], $this->noop);
+
+        $this->assertFileDoesNotExist($cachedPath);
     }
 
     public function testPrune()
@@ -300,20 +340,16 @@ class FileCacheTest extends TestCase
         touch("{$this->cachePath}/abc", time() - 1);
         $this->app['files']->put("{$this->cachePath}/def", 'def');
 
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_size' => 3,
-        ]);
+        $cache = $this->createCache(['max_size' => 3]);
         $cache->prune();
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/abc"));
-        $this->assertTrue($this->app['files']->exists("{$this->cachePath}/def"));
 
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_size' => 0,
-        ]);
+        $this->assertFileDoesNotExist("{$this->cachePath}/abc");
+        $this->assertFileExists("{$this->cachePath}/def");
+
+        $cache = $this->createCache(['max_size' => 0]);
         $cache->prune();
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/def"));
+
+        $this->assertFileDoesNotExist("{$this->cachePath}/def");
     }
 
     public function testPruneAge()
@@ -322,47 +358,51 @@ class FileCacheTest extends TestCase
         touch("{$this->cachePath}/abc", time() - 61);
         $this->app['files']->put("{$this->cachePath}/def", 'def');
 
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_age' => 1,
-        ]);
+        $cache = $this->createCache(['max_age' => 1]);
         $cache->prune();
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/abc"));
-        $this->assertTrue($this->app['files']->exists("{$this->cachePath}/def"));
+
+        $this->assertFileDoesNotExist("{$this->cachePath}/abc");
+        $this->assertFileExists("{$this->cachePath}/def");
     }
 
     public function testClear()
     {
         $this->app['files']->put("{$this->cachePath}/abc", 'abc');
         $this->app['files']->put("{$this->cachePath}/def", 'abc');
+
         $handle = fopen("{$this->cachePath}/def", 'rb');
         flock($handle, LOCK_SH);
-        (new FileCache(['path' => $this->cachePath]))->clear();
-        fclose($handle);
-        $this->assertTrue($this->app['files']->exists("{$this->cachePath}/def"));
-        $this->assertFalse($this->app['files']->exists("{$this->cachePath}/abc"));
+
+        try {
+            $this->createCache()->clear();
+
+            $this->assertFileExists("{$this->cachePath}/def");
+            $this->assertFileDoesNotExist("{$this->cachePath}/abc");
+        } finally {
+            if (is_resource($handle)) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+        }
     }
 
     public function testMimeTypeWhitelist()
     {
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'mime_types' => ['image/jpeg'],
-        ]);
+        $cache = $this->createCache(['mime_types' => ['image/jpeg']]);
+
+        // Should work for allowed MIME type
         $cache->get(new GenericFile('fixtures://test-image.jpg'), $this->noop);
 
-        try {
-            $cache->get(new GenericFile('fixtures://test-file.txt'), $this->noop);
-            $this->fail('Expected an Exception to be thrown.');
-        } catch (MimeTypeIsNotAllowedException $e) {
-            $this->assertStringContainsString("text/plain", $e->getMessage());
-        }
+        // Should throw for disallowed MIME type
+        $this->expectException(MimeTypeIsNotAllowedException::class);
+        $this->expectExceptionMessage('text/plain');
+        $cache->get(new GenericFile('fixtures://test-file.txt'), $this->noop);
     }
 
     public function testExistsDisk()
     {
         $file = new GenericFile('test://test-image.jpg');
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
         $this->assertFalse($cache->exists($file));
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
@@ -373,10 +413,7 @@ class FileCacheTest extends TestCase
     {
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
         $file = new GenericFile('test://test-image.jpg');
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_file_size' => 1,
-        ]);
+        $cache = $this->createCache(['max_file_size' => 1]);
 
         $this->expectException(FileIsTooLargeException::class);
         $cache->exists($file);
@@ -386,75 +423,44 @@ class FileCacheTest extends TestCase
     {
         $this->app['files']->put("{$this->diskPath}/test-file.txt", 'abc');
         $file = new GenericFile('test://test-file.txt');
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'mime_types' => ['image/jpeg'],
-        ]);
+        $cache = $this->createCache(['mime_types' => ['image/jpeg']]);
 
-        try {
-            $cache->exists($file);
-            $this->fail('Expected an Exception to be thrown.');
-        } catch (MimeTypeIsNotAllowedException $e) {
-            $this->assertStringContainsString("text/plain", $e->getMessage());
-        }
+        $this->expectException(MimeTypeIsNotAllowedException::class);
+        $this->expectExceptionMessage('text/plain');
+        $cache->exists($file);
     }
 
     public function testExistsRemote404()
     {
-        $mock = new MockHandler([new Response(404)]);
-        $handlerStack = HandlerStack::create($mock);
-        $client = new Client([
-            'handler' => $handlerStack,
-            'http_errors' => false,
-        ]);
-
         $file = new GenericFile('https://example.com/file');
-        $cache = new FileCache(['path' => $this->cachePath], client: $client);
+        $cache = $this->createCacheWithMockClient([new Response(404)]);
+
         $this->assertFalse($cache->exists($file));
     }
 
     public function testExistsRemote500()
     {
-        $mock = new MockHandler([new Response(500)]);
-        $handlerStack = HandlerStack::create($mock);
-        $client = new Client([
-            'handler' => $handlerStack,
-            'http_errors' => false,
-        ]);
-
         $file = new GenericFile('https://example.com/file');
-        $cache = new FileCache(['path' => $this->cachePath], client: $client);
+        $cache = $this->createCacheWithMockClient([new Response(500)]);
+
         $this->assertFalse($cache->exists($file));
     }
 
     public function testExistsRemote200()
     {
-        $mock = new MockHandler([new Response(200)]);
-        $handlerStack = HandlerStack::create($mock);
-        $client = new Client([
-            'handler' => $handlerStack,
-            'http_errors' => false,
-        ]);
-
         $file = new GenericFile('https://example.com/file');
-        $cache = new FileCache(['path' => $this->cachePath], client: $client);
+        $cache = $this->createCacheWithMockClient([new Response(200)]);
+
         $this->assertTrue($cache->exists($file));
     }
 
     public function testExistsRemoteTooLarge()
     {
-        $mock = new MockHandler([new Response(200, ['content-length' => 100])]);
-        $handlerStack = HandlerStack::create($mock);
-        $client = new Client([
-            'handler' => $handlerStack,
-            'http_errors' => false,
-        ]);
-
         $file = new GenericFile('https://example.com/file');
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_file_size' => 1,
-        ], client: $client);
+        $cache = $this->createCacheWithMockClient(
+            [new Response(200, ['content-length' => 100])],
+            ['max_file_size' => 1]
+        );
 
         $this->expectException(FileIsTooLargeException::class);
         $cache->exists($file);
@@ -462,62 +468,45 @@ class FileCacheTest extends TestCase
 
     public function testExistsRemoteMimeNotAllowed()
     {
-        $mock = new MockHandler([new Response(200, ['content-type' => 'application/json'])]);
-        $handlerStack = HandlerStack::create($mock);
-        $client = new Client([
-            'handler' => $handlerStack,
-            'http_errors' => false,
-        ]);
-
         $file = new GenericFile('https://example.com/file');
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'mime_types' => ['image/jpeg'],
-        ], client: $client);
+        $cache = $this->createCacheWithMockClient(
+            [new Response(200, ['content-type' => 'application/json'])],
+            ['mime_types' => ['image/jpeg']]
+        );
 
-        try {
-            $cache->exists($file);
-            $this->fail('Expected an Exception to be thrown.');
-        } catch (MimeTypeIsNotAllowedException $e) {
-            $this->assertStringContainsString("application/json", $e->getMessage());
-        }
+        $this->expectException(MimeTypeIsNotAllowedException::class);
+        $this->expectExceptionMessage('application/json');
+        $cache->exists($file);
     }
 
     public function testExistsRemoteTimeout()
     {
-        $file = new GenericFile('https://files.example.com/image.jpg');
-        $request = new Request('HEAD', $file->getUrl());
+        $url = 'https://files.example.com/image.jpg';
+        $file = new GenericFile($url);
+        $request = new Request('HEAD', $url);
         $connectException = new ConnectException('Example of connection failed', $request);
 
-        $mock = new MockHandler([
-            $connectException,
-        ]);
-        $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
+        $cache = $this->createCacheWithMockClient([$connectException]);
 
-        try {
-            $cache->exists($file);
-            $this->fail('Expected an ConnectException to be thrown.');
-        } catch (ConnectException $e) {
-            $this->assertEquals('Example of connection failed', $e->getMessage());
-        }
+        $this->expectException(ConnectException::class);
+        $this->expectExceptionMessage('Example of connection failed');
+        $cache->exists($file);
     }
 
     public function testGetRemoteThrowsConnectExceptionOnGetRequest()
     {
-        $file = new GenericFile('https://files.example.com/image.jpg');
-        $hash = hash('sha256', 'https://files.example.com/image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
-        $request = new Request('GET', $file->getUrl());
+        $url = 'https://files.example.com/image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+        $request = new Request('GET', $url);
         $connectException = new ConnectException('Example of connection failed', $request);
 
-        $mock = new MockHandler([$connectException]);
-        $cache = new FileCache(['path' => $this->cachePath], new Client(['handler' => HandlerStack::create($mock)]));
+        $cache = $this->createCacheWithMockClient([$connectException]);
 
         try {
+            $this->expectException(ConnectException::class);
+            $this->expectExceptionMessage('Example of connection failed');
             $cache->get($file, $this->noop);
-            $this->fail('Expected an ConnectException to be thrown.');
-        } catch (ConnectException $e) {
-            $this->assertEquals('Example of connection failed', $e->getMessage());
         } finally {
             $this->assertFileDoesNotExist($cachedPath);
         }
@@ -525,33 +514,26 @@ class FileCacheTest extends TestCase
 
     public function testGetDiskThrowsSourceResourceTimeoutException()
     {
-        config(['filesystems.disks.s3' => ['driver' => 's3']]);
-        $file = new GenericFile('s3://files/test-image.jpg');
-        $hash = hash('sha256', 's3://files/test-image.jpg');
+        $url = 's3://files/test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+
         $stream = fopen('php://temp', 'r+');
         fwrite($stream, 'some data');
         rewind($stream);
-
-        $filesystemManagerMock = $this->createMock(FilesystemManager::class);
-        $filesystemMock = $this->createMock(FilesystemAdapter::class);
-        $filesystemMock->method('readStream')->willReturn($stream);
-        $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
-        $this->app['filesystem'] = $filesystemManagerMock;
+        $this->mockS3Filesystem($stream);
 
         $streamGetMetaDataMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
         $streamGetMetaDataMock->expects($this->atLeastOnce())->willReturn(['timed_out' => true]);
 
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'read_timeout' => 0.1,
-        ]);
+        $cache = $this->createCache(['read_timeout' => 0.1]);
 
         $this->expectException(SourceResourceTimedOutException::class);
 
         try {
             $cache->get($file, $this->noop);
         } finally {
-            $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+            $this->assertFileDoesNotExist($cachedPath);
             if (is_resource($stream)) {
                 fclose($stream);
             }
@@ -560,23 +542,19 @@ class FileCacheTest extends TestCase
 
     public function testGetDiskThrowsSourceResourceInvalidExceptionOnCopyFail()
     {
-        config(['filesystems.disks.s3' => ['driver' => 's3']]);
-        $file = new GenericFile('s3://files/test-image.jpg');
-        $hash = hash('sha256', 's3://files/test-image.jpg');
+        $url = 's3://files/test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+
         $stream = fopen('php://temp', 'r+');
         fwrite($stream, 'some data');
         rewind($stream);
-
-        $filesystemManagerMock = $this->createMock(FilesystemManager::class);
-        $filesystemMock = $this->createMock(FilesystemAdapter::class);
-        $filesystemMock->method('readStream')->willReturn($stream);
-        $filesystemManagerMock->method('disk')->with('s3')->willReturn($filesystemMock);
-        $this->app['filesystem'] = $filesystemManagerMock;
+        $this->mockS3Filesystem($stream);
 
         $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
         $streamCopyMock->expects($this->once())->willReturn(false);
 
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
         $this->expectException(SourceResourceIsInvalidException::class);
         $this->expectExceptionMessage('Failed to copy stream data');
@@ -584,7 +562,7 @@ class FileCacheTest extends TestCase
         try {
             $cache->get($file, $this->noop);
         } finally {
-            $this->assertFalse($this->app['files']->exists("{$this->cachePath}/{$hash}"));
+            $this->assertFileDoesNotExist($cachedPath);
             if (is_resource($stream)) {
                 fclose($stream);
             }
@@ -593,35 +571,32 @@ class FileCacheTest extends TestCase
 
     public function testRetrieveThrowsFailedToRetrieveFileExceptionAfterMaxAttempts()
     {
-        $file = new GenericFile('fixtures://test-file.txt');
-        $hash = hash('sha256', 'fixtures://test-file.txt');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'fixtures://test-file.txt';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
         $this->assertTrue($this->app['filesystem']->disk('fixtures')->exists('test-file.txt'));
         touch($cachedPath);
         $this->assertFileExists($cachedPath);
+
         $fopenMock = $this->getFunctionMock('Jackardios\\FileCache', 'fopen');
-        $fopenMock->expects($this->atLeast(3)) // Expects >= 3 attempts fopen()
+        $fopenMock->expects($this->atLeast(3))
             ->willReturnCallback(function ($path, $mode) use ($cachedPath) {
                 if ($path === $cachedPath) {
                     if ($mode === 'xb+') {
-                        // This call should return false since the file exists (due to touch)
-                        // Let the original fopen handle it
                         return \fopen($path, $mode);
                     }
                     if ($mode === 'rb') {
-                        // Simulate a permanent failure to open an existing cache file for reading
                         return false;
                     }
                 }
-                // Allow normal behavior for all other fopen calls
                 return \fopen($path, $mode);
             });
 
         $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
         $usleepMock->expects($this->any());
 
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
 
         $this->expectException(FailedToRetrieveFileException::class);
         $this->expectExceptionMessage('Failed to retrieve file after 3 attempts');
@@ -651,26 +626,20 @@ class FileCacheTest extends TestCase
         touch($lockedFile, time() - 100);
         clearstatcache(true, $lockedFile);
 
-
         $handle = fopen($lockedFile, 'rb');
         $this->assertTrue(flock($handle, LOCK_SH));
 
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_age' => 1,
-            'max_size' => 1000^2,
-        ]);
-
+        $cache = $this->createCache(['max_age' => 1, 'max_size' => 1000 ** 2]);
         $cache->prune();
 
-        $this->assertFalse($this->app['files']->exists($unlockedFile), "Unlocked file should be pruned.");
-        $this->assertTrue($this->app['files']->exists($lockedFile), "Locked file should NOT be pruned.");
+        $this->assertFileDoesNotExist($unlockedFile, "Unlocked file should be pruned.");
+        $this->assertFileExists($lockedFile, "Locked file should NOT be pruned.");
 
         flock($handle, LOCK_UN);
         fclose($handle);
 
         $cache->prune();
-        $this->assertFalse($this->app['files']->exists($lockedFile), "Unlocked file should be pruned now.");
+        $this->assertFileDoesNotExist($lockedFile, "Unlocked file should be pruned now.");
     }
 
     /**
@@ -679,7 +648,7 @@ class FileCacheTest extends TestCase
      */
     public function testEncodeUrl(string $inputUrl, string $expectedUrl)
     {
-        $cache = new FileCache();
+        $cache = $this->createCache();
         $method = new ReflectionMethod(FileCache::class, 'encodeUrl');
         $method->setAccessible(true);
 
@@ -699,10 +668,10 @@ class FileCacheTest extends TestCase
 
     public function testGetOnceDoesNotDeleteLockedFile()
     {
-        $file = new GenericFile('fixtures://test-image.jpg');
-        $hash = hash('sha256', 'fixtures://test-image.jpg');
-        $cachedPath = "{$this->cachePath}/{$hash}";
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $url = 'fixtures://test-image.jpg';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+        $cache = $this->createCache();
 
         $handle = null;
         $result = $cache->getOnce($file, function ($file, $path) use (&$handle) {
@@ -723,20 +692,17 @@ class FileCacheTest extends TestCase
 
     public function testGetWaitsForLockReleaseWhenNotThrowing()
     {
-        $file = new GenericFile('fixtures://test-file.txt');
-        $hash = hash('sha256', 'fixtures://test-file.txt');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'fixtures://test-file.txt';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
         // Simulate: Another process started recording and set LOCK_EX
-        // Create a file manually to simulate the start of recording
         $this->assertTrue(touch($cachedPath), "Failed to create cache file for locking.");
         $writingProcessHandle = fopen($cachedPath, 'rb+');
         $this->assertIsResource($writingProcessHandle, "Failed to open handle for writing process simulation.");
         $this->assertTrue(flock($writingProcessHandle, LOCK_EX), "Failed to acquire LOCK_EX for writing simulation.");
 
-        // Set up a mock for flock in the class under test:
-        // - The first few attempts to get LOCK_SH | LOCK_NB should return false.
-        // - Then one attempt should return true (simulating the removal of LOCK_EX).
+        // Mock flock to simulate waiting for lock release
         $flockMock = $this->getFunctionMock('Jackardios\\FileCache', 'flock');
         $lockAttempt = 0;
         $maxAttemptsBeforeSuccess = 3;
@@ -750,43 +716,34 @@ class FileCacheTest extends TestCase
                         $sharedLockHandle = $handle;
                     }
 
-                    // Only interested in trying to get LOCK_SH without waiting
                     if ($handle === $sharedLockHandle && ($operation === (LOCK_SH | LOCK_NB) || $operation === LOCK_SH)) {
                         $lockAttempt++;
                         if ($lockAttempt <= $maxAttemptsBeforeSuccess) {
-                            // Simulate that the file is still exclusively locked
                             return false;
-                        } else {
-                            // Simulate that exclusive lock is released
-                            // Release real lock so that subsequent fstat etc. work
-                            if (is_resource($writingProcessHandle)) {
-                                \flock($writingProcessHandle, LOCK_UN);
-                                fclose($writingProcessHandle);
-                                $writingProcessHandle = null;
-                            }
-
-                            return \flock($handle, $operation); // Use real flock to set LOCK_SH
                         }
+                        if (is_resource($writingProcessHandle)) {
+                            \flock($writingProcessHandle, LOCK_UN);
+                            fclose($writingProcessHandle);
+                            $writingProcessHandle = null;
+                        }
+                        return \flock($handle, $operation);
                     }
 
-                    // For all other flock calls (e.g. initial LOCK_EX, LOCK_UN) - actual behavior
                     return \flock($handle, $operation);
                 }
             );
 
-        // Mock usleep to make sure the wait happens
         $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
         $usleepMock->expects($this->exactly($maxAttemptsBeforeSuccess));
 
-        $cache = new FileCache(['path' => $this->cachePath]);
-        $resultPath = $cache->get($file, $this->noop, false); // $throwOnLock = false
+        $cache = $this->createCache();
+        $resultPath = $cache->get($file, $this->noop, false);
 
         $this->assertEquals($cachedPath, $resultPath);
         $this->assertFileExists($cachedPath);
-        $this->assertGreaterThanOrEqual($maxAttemptsBeforeSuccess, $lockAttempt, "LOCK_SH should have been attempted multiple times.");
-        $this->assertGreaterThan(0, filesize($cachedPath), "Cached file should not be empty after successful retrieval.");
+        $this->assertGreaterThanOrEqual($maxAttemptsBeforeSuccess, $lockAttempt);
+        $this->assertGreaterThan(0, filesize($cachedPath));
 
-        // Cleanup (if $writingProcessHandle was not closed in mock)
         if (is_resource($writingProcessHandle)) {
             \flock($writingProcessHandle, LOCK_UN);
             fclose($writingProcessHandle);
@@ -795,11 +752,11 @@ class FileCacheTest extends TestCase
 
     public function testMultipleReadersAccessCachedFileSimultaneously()
     {
-        $file = new GenericFile('fixtures://test-file.txt');
-        $hash = hash('sha256', 'fixtures://test-file.txt');
-        $cachedPath = "{$this->cachePath}/{$hash}";
+        $url = 'fixtures://test-file.txt';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $cache = new FileCache(['path' => $this->cachePath]);
+        $cache = $this->createCache();
         $initialPath = $cache->get($file, $this->noop);
         $this->assertEquals($cachedPath, $initialPath);
         $this->assertFileExists($cachedPath);
@@ -809,25 +766,15 @@ class FileCacheTest extends TestCase
         $this->assertTrue(flock($reader1Handle, LOCK_SH), "Reader 1 failed to acquire LOCK_SH.");
 
         // The second reader tries to get the file (must successfully get LOCK_SH)
-        $reader2Path = null;
         $reader2Handle = null;
-        try {
-            $reader2Path = $cache->get($file, function($file, $path) use (&$reader2Handle) {
-                // Let's try to open and block inside a callback to make sure it's possible
-                $reader2Handle = fopen($path, 'rb');
-                $this->assertTrue(flock($reader2Handle, LOCK_SH), "Reader 2 failed to acquire LOCK_SH while Reader 1 held lock.");
-                return $path;
-            });
-        } catch (\Exception $e) {
-            // Release the first reader's lock in case of error
-            flock($reader1Handle, LOCK_UN);
-            fclose($reader1Handle);
-            if (is_resource($reader2Handle)) fclose($reader2Handle);
-            $this->fail("Reader 2 failed to get cached file while Reader 1 held LOCK_SH: " . $e->getMessage());
-        }
+        $reader2Path = $cache->get($file, function ($file, $path) use (&$reader2Handle) {
+            $reader2Handle = fopen($path, 'rb');
+            $this->assertTrue(flock($reader2Handle, LOCK_SH), "Reader 2 failed to acquire LOCK_SH.");
+            return $path;
+        });
 
         $this->assertEquals($cachedPath, $reader2Path);
-        $this->assertIsResource($reader2Handle, "Reader 2 handle should be a resource.");
+        $this->assertIsResource($reader2Handle);
 
         flock($reader1Handle, LOCK_UN);
         fclose($reader1Handle);
@@ -837,36 +784,25 @@ class FileCacheTest extends TestCase
 
     public function testGetRemotePartialDownloadTimeout()
     {
-        $fileUrl = 'https://files.example.com/large-file.zip';
-        $file = new GenericFile($fileUrl);
-        $hash = hash('sha256', $fileUrl);
-        $cachedPath = "{$this->cachePath}/{$hash}";
-        $partialContent = 'some partial data';
-        $readTimeout = 0.1;
+        $url = 'https://files.example.com/large-file.zip';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
 
-        $mockResponse = new Response(200, ['Content-Type' => 'application/zip']);
-        $mock = new MockHandler([$mockResponse]);
-        $client = new Client(['handler' => HandlerStack::create($mock)]);
+        $cache = $this->createCacheWithMockClient(
+            [new Response(200, ['Content-Type' => 'application/zip'])],
+            ['read_timeout' => 0.1]
+        );
 
         $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
         $streamCopyMock->expects($this->once())
-        ->willReturnCallback(function ($source, $dest, $maxLength) use ($partialContent) {
-            fwrite($dest, $partialContent);
-            // Simulate that copying was interrupted (returned false)
-            return false;
-        });
+            ->willReturnCallback(function ($source, $dest, $maxLength) {
+                fwrite($dest, 'some partial data');
+                return false;
+            });
 
-        // 3. Мок stream_get_meta_data
-        // Must be called AFTER stream_copy_to_stream fails
         $streamMetaMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
-        // Can be called multiple times (in cacheFromResource and in getRemoteFile)
         $streamMetaMock->expects($this->atLeastOnce())
-            ->willReturn(['timed_out' => true]); // simulate timeout
-
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'read_timeout' => $readTimeout,
-        ], $client);
+            ->willReturn(['timed_out' => true]);
 
         $this->expectException(SourceResourceTimedOutException::class);
 
@@ -874,12 +810,681 @@ class FileCacheTest extends TestCase
             $cache->get($file, $this->noop);
         } catch (SourceResourceTimedOutException $e) {
             clearstatcache(true, $cachedPath);
-            $this->assertFileDoesNotExist($cachedPath, "Partially downloaded file should have been deleted after timeout.");
+            $this->assertFileDoesNotExist($cachedPath);
             throw $e;
         } finally {
             if (file_exists($cachedPath)) {
                 unlink($cachedPath);
             }
         }
+    }
+
+    public function testConfigValidationThrowsOnInvalidMaxFileSize()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('max_file_size');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'max_file_size' => -2, // Invalid: must be -1 or positive
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidMaxAge()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('max_age');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'max_age' => 0, // Invalid: must be at least 1
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidLockMaxAttempts()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('lock_max_attempts');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'lock_max_attempts' => 0, // Invalid: must be at least 1
+        ]);
+    }
+
+    public function testAllowedHostsValidation()
+    {
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['example.com', 'cdn.example.com'],
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        // Should not throw for allowed host
+        $method->invoke($cache, 'https://example.com/image.jpg');
+        $method->invoke($cache, 'https://cdn.example.com/image.jpg');
+
+        // Should throw for disallowed host
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $method->invoke($cache, 'https://evil.com/image.jpg');
+    }
+
+    public function testAllowedHostsWildcard()
+    {
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['*.example.com'],
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        // Should allow subdomains
+        $method->invoke($cache, 'https://cdn.example.com/image.jpg');
+        $method->invoke($cache, 'https://images.cdn.example.com/image.jpg');
+
+        // Should also allow the root domain
+        $method->invoke($cache, 'https://example.com/image.jpg');
+
+        // Should throw for different domain
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $method->invoke($cache, 'https://notexample.com/image.jpg');
+    }
+
+    public function testAllowedHostsNullAllowsAll()
+    {
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => null,
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        // Should allow any host when allowed_hosts is null
+        $method->invoke($cache, 'https://any-domain.com/image.jpg');
+        $method->invoke($cache, 'https://another-domain.org/file.png');
+
+        // This should pass without exception
+        $this->assertTrue(true);
+    }
+
+    public function testGenericFileThrowsOnEmptyUrl()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('cannot be empty');
+
+        new GenericFile('');
+    }
+
+    public function testEncodeUrlBrackets()
+    {
+        $cache = new FileCache(['path' => $this->cachePath]);
+        $method = new ReflectionMethod(FileCache::class, 'encodeUrl');
+        $method->setAccessible(true);
+
+        $this->assertEquals(
+            'http://example.com/path%5Bwith%5D/brackets.jpg',
+            $method->invoke($cache, 'http://example.com/path[with]/brackets.jpg')
+        );
+    }
+
+    public function testBatchChunking()
+    {
+        $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
+
+        // Create 5 files but set chunk size to 2
+        $files = [];
+        for ($i = 0; $i < 5; $i++) {
+            $files[] = new GenericFile('test://test-image.jpg');
+        }
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'batch_chunk_size' => 2, // Process in chunks of 2
+        ]);
+
+        $callbackCalled = false;
+        $paths = $cache->batch($files, function ($receivedFiles, $receivedPaths) use (&$callbackCalled) {
+            $callbackCalled = true;
+            $this->assertCount(5, $receivedFiles);
+            $this->assertCount(5, $receivedPaths);
+            return $receivedPaths;
+        });
+
+        $this->assertTrue($callbackCalled);
+        $this->assertCount(5, $paths);
+    }
+
+    public function testBatchChunkingDisabled()
+    {
+        $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
+
+        $files = [];
+        for ($i = 0; $i < 5; $i++) {
+            $files[] = new GenericFile('test://test-image.jpg');
+        }
+
+        // batch_chunk_size = -1 disables chunking
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'batch_chunk_size' => -1,
+        ]);
+
+        $paths = $cache->batch($files, function ($files, $paths) {
+            return $paths;
+        });
+
+        $this->assertCount(5, $paths);
+    }
+
+    public function testHttpRetryOnServerError()
+    {
+        $file = new GenericFile('https://files/image.jpg');
+        $hash = hash('sha256', 'https://files/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
+        // First request fails with 500, second succeeds
+        $mock = new MockHandler([
+            new Response(500, [], 'Server Error'),
+            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'http_retries' => 1,
+            'http_retry_delay' => 10, // 10ms
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertEquals($cachedPath, $path);
+        $this->assertFileExists($cachedPath);
+    }
+
+    public function testHttpNoRetryOnClientError()
+    {
+        $file = new GenericFile('https://files/image.jpg');
+
+        // 404 should not be retried - using Response (not RequestException) to test new status code handling
+        $mock = new MockHandler([
+            new Response(404, [], 'Not Found'),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'http_retries' => 3,
+        ], new Client([
+            'handler' => HandlerStack::create($mock),
+            'http_errors' => false,
+        ]));
+
+        $this->expectException(FailedToRetrieveFileException::class);
+        $this->expectExceptionMessage('status code 404');
+        $cache->get($file, $this->noop);
+    }
+
+    public function testHttpRetryOn429RateLimit()
+    {
+        $file = new GenericFile('https://files/image.jpg');
+        $hash = hash('sha256', 'https://files/image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
+        // 429 should be retried - using Response to test new status code handling
+        $mock = new MockHandler([
+            new Response(429, [], 'Rate limited'),
+            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'http_retries' => 1,
+            'http_retry_delay' => 10,
+        ], new Client([
+            'handler' => HandlerStack::create($mock),
+            'http_errors' => false,
+        ]));
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertEquals($cachedPath, $path);
+    }
+
+    public function testPruneTimeout()
+    {
+        // Create several files that should be pruned by age
+        for ($i = 0; $i < 5; $i++) {
+            $this->app['files']->put("{$this->cachePath}/file_{$i}", str_repeat('x', 100));
+            touch("{$this->cachePath}/file_{$i}", time() - 120); // 2 minutes old
+        }
+
+        // Mock time() to simulate timeout after a few iterations
+        // Use a fixed base time to make the test deterministic
+        $baseTime = 1000000;
+        $timeMock = $this->getFunctionMock('Jackardios\\FileCache', 'time');
+        $callCount = 0;
+        $timeMock->expects($this->any())->willReturnCallback(function () use (&$callCount, $baseTime) {
+            $callCount++;
+            // First 3 calls return base time (for startTime and initial checks)
+            // After that, return base time + timeout + 1 to trigger timeout
+            if ($callCount <= 3) {
+                return $baseTime;
+            }
+            return $baseTime + 10; // 10 seconds later, exceeds 1 second timeout
+        });
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'max_age' => 1, // 1 minute
+            'prune_timeout' => 1, // 1 second timeout
+        ]);
+
+        $cache->prune();
+
+        // Some files should still exist due to timeout
+        $remainingFiles = glob("{$this->cachePath}/file_*");
+        $this->assertNotEmpty($remainingFiles, "Some files should remain after prune timeout");
+    }
+
+    public function testConfigValidationThrowsOnInvalidMaxSize()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('max_size');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'max_size' => -1, // Invalid: must be 0 or positive
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidLockWaitTimeout()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('lock_wait_timeout');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'lock_wait_timeout' => -2, // Invalid: must be -1 or non-negative
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidTimeout()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('timeout');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'timeout' => -2, // Invalid: must be -1 or non-negative
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidConnectTimeout()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('connect_timeout');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'connect_timeout' => -2, // Invalid: must be -1 or non-negative
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidReadTimeout()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('read_timeout');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'read_timeout' => -2, // Invalid: must be -1 or non-negative
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidPruneTimeout()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('prune_timeout');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'prune_timeout' => -2, // Invalid: must be -1 or non-negative
+        ]);
+    }
+
+    public function testConfigValidationThrowsOnInvalidBatchChunkSize()
+    {
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('batch_chunk_size');
+
+        new FileCache([
+            'path' => $this->cachePath,
+            'batch_chunk_size' => 0, // Invalid: must be -1 or positive
+        ]);
+    }
+
+    public function testAllowedHostsFromEnvString()
+    {
+        // Simulate env string format (comma-separated)
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => 'example.com, cdn.example.com, *.trusted.com',
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        // Should not throw for allowed hosts
+        $method->invoke($cache, 'https://example.com/image.jpg');
+        $method->invoke($cache, 'https://cdn.example.com/image.jpg');
+        $method->invoke($cache, 'https://sub.trusted.com/image.jpg');
+
+        // Should throw for disallowed host
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $method->invoke($cache, 'https://evil.com/image.jpg');
+    }
+
+    public function testAllowedHostsEmptyAllowsAll()
+    {
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => [], // Empty array should allow all
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        // Should allow any host when allowed_hosts is empty
+        $method->invoke($cache, 'https://any-domain.com/image.jpg');
+        $this->assertTrue(true); // No exception thrown
+    }
+
+    public function testAllowedHostsThrowsOnEmptyHost()
+    {
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['example.com'],
+        ]);
+
+        $method = new ReflectionMethod(FileCache::class, 'validateHost');
+        $method->setAccessible(true);
+
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $this->expectExceptionMessage('(empty)');
+        $method->invoke($cache, '/no-host-url');
+    }
+
+    public function testGetRemoteWithAllowedHostsValidation()
+    {
+        $file = new GenericFile('https://allowed.example.com/image.jpg');
+
+        $mock = new MockHandler([
+            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['allowed.example.com'],
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertFileExists($path);
+    }
+
+    public function testGetRemoteBlocksDisallowedHost()
+    {
+        $file = new GenericFile('https://blocked.example.com/image.jpg');
+
+        $mock = new MockHandler([
+            new Response(200, [], file_get_contents(__DIR__.'/files/test-image.jpg')),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['allowed.example.com'],
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $cache->get($file, $this->noop);
+    }
+
+    public function testExistsRemoteBlocksDisallowedHost()
+    {
+        $file = new GenericFile('https://blocked.example.com/image.jpg');
+
+        $mock = new MockHandler([
+            new Response(200),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'allowed_hosts' => ['allowed.example.com'],
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $this->expectException(\Jackardios\FileCache\Exceptions\HostNotAllowedException::class);
+        $cache->exists($file);
+    }
+
+    public function testExistsRemoteMimeTypeWithCharset()
+    {
+        // MIME type with charset should be handled correctly
+        $mock = new MockHandler([
+            new Response(200, ['content-type' => 'text/plain; charset=utf-8']),
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'mime_types' => ['text/plain'],
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $file = new GenericFile('https://example.com/file.txt');
+        $this->assertTrue($cache->exists($file));
+    }
+
+    public function testBatchOnceDeletesFilesAfterCallback()
+    {
+        $file = new GenericFile('fixtures://test-image.jpg');
+        $hash = hash('sha256', 'fixtures://test-image.jpg');
+        $cachedPath = "{$this->cachePath}/{$hash}";
+
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        $pathInCallback = null;
+        $cache->batchOnce([$file], function ($files, $paths) use (&$pathInCallback) {
+            $pathInCallback = $paths[0];
+            $this->assertFileExists($paths[0]);
+            return $paths;
+        });
+
+        $this->assertNotNull($pathInCallback);
+        $this->assertFileDoesNotExist($cachedPath);
+    }
+
+    public function testBatchOnceThrowOnLock()
+    {
+        $cache = $this->createCache();
+        $url = 'abc://some/image.jpg';
+        $file = new GenericFile($url);
+        $path = $this->getCachedPath($url);
+        touch($path, time() - 1);
+
+        $handle = fopen($path, 'w');
+        flock($handle, LOCK_EX);
+
+        try {
+            $this->expectException(FileLockedException::class);
+            $cache->batchOnce([$file], fn ($file, $path) => $file, true);
+        } finally {
+            if (is_resource($handle)) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+            }
+        }
+    }
+
+    public function testPruneOnNonExistentPath()
+    {
+        $nonExistentPath = sys_get_temp_dir() . '/non_existent_path_' . uniqid();
+        $cache = new FileCache(['path' => $nonExistentPath]);
+
+        // Should not throw exception
+        $cache->prune();
+        $this->assertTrue(true);
+    }
+
+    public function testClearOnNonExistentPath()
+    {
+        $nonExistentPath = sys_get_temp_dir() . '/non_existent_path_' . uniqid();
+        $cache = new FileCache(['path' => $nonExistentPath]);
+
+        // Should not throw exception
+        $cache->clear();
+        $this->assertTrue(true);
+    }
+
+    public function testRetrieveCreatesPathIfNotExists()
+    {
+        $newPath = sys_get_temp_dir() . '/new_cache_path_' . uniqid();
+        $this->assertDirectoryDoesNotExist($newPath);
+
+        $file = new GenericFile('fixtures://test-file.txt');
+        $cache = new FileCache(['path' => $newPath]);
+
+        try {
+            $cache->get($file, $this->noop);
+            $this->assertDirectoryExists($newPath);
+        } finally {
+            $this->app['files']->deleteDirectory($newPath);
+        }
+    }
+
+    public function testGetDefaultCallback()
+    {
+        $file = new GenericFile('fixtures://test-file.txt');
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        // get() without callback should return path
+        $result = $cache->get($file);
+        $this->assertIsString($result);
+        $this->assertFileExists($result);
+    }
+
+    public function testBatchDefaultCallback()
+    {
+        $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');
+        $file = new GenericFile('test://test-image.jpg');
+
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        // batch() without callback should return array of paths
+        $result = $cache->batch([$file]);
+        $this->assertIsArray($result);
+        $this->assertCount(1, $result);
+        $this->assertFileExists($result[0]);
+    }
+
+    public function testGetOnceDefaultCallback()
+    {
+        $file = new GenericFile('fixtures://test-file.txt');
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        // getOnce() without callback should return path (and delete file)
+        $result = $cache->getOnce($file);
+        $this->assertIsString($result);
+    }
+
+    public function testBatchOnceDefaultCallback()
+    {
+        $file = new GenericFile('fixtures://test-file.txt');
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        // batchOnce() without callback should return array of paths
+        $result = $cache->batchOnce([$file]);
+        $this->assertIsArray($result);
+        $this->assertCount(1, $result);
+    }
+
+    public function testUnlimitedFileSize()
+    {
+        $this->app['files']->put("{$this->diskPath}/large-file.txt", str_repeat('x', 10000));
+        $file = new GenericFile('test://large-file.txt');
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'max_file_size' => -1, // Unlimited
+        ]);
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertFileExists($path);
+    }
+
+    public function testExistsDiskUnlimitedFileSize()
+    {
+        $this->app['files']->put("{$this->diskPath}/large-file.txt", str_repeat('x', 10000));
+        $file = new GenericFile('test://large-file.txt');
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'max_file_size' => -1, // Unlimited
+        ]);
+
+        $this->assertTrue($cache->exists($file));
+    }
+
+    public function testExistsRemoteUnlimitedFileSize()
+    {
+        $mock = new MockHandler([
+            new Response(200, ['content-length' => 1000000]), // 1MB
+        ]);
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'max_file_size' => -1, // Unlimited
+        ], new Client(['handler' => HandlerStack::create($mock)]));
+
+        $file = new GenericFile('https://example.com/large-file.zip');
+        $this->assertTrue($cache->exists($file));
+    }
+
+    public function testGenericFileRejectsInvalidUrl()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('protocol');
+        new GenericFile('invalid-url-without-protocol');
+    }
+
+    public function testGetDiskFileNotFound()
+    {
+        config(['filesystems.disks.test' => ['driver' => 'local', 'root' => $this->diskPath]]);
+        $file = new GenericFile('test://non-existent-file.txt');
+
+        $cache = new FileCache(['path' => $this->cachePath]);
+
+        $this->expectException(FileNotFoundException::class);
+        $cache->get($file, $this->noop);
+    }
+
+    public function testPruneBySizeDeletesOldestFiles()
+    {
+        // Create files with different access times
+        $this->app['files']->put("{$this->cachePath}/old", str_repeat('a', 100));
+        touch("{$this->cachePath}/old", time() - 10, time() - 10);
+
+        $this->app['files']->put("{$this->cachePath}/new", str_repeat('b', 100));
+        // new file has current atime
+
+        clearstatcache();
+
+        $cache = new FileCache([
+            'path' => $this->cachePath,
+            'max_size' => 100, // Only allow 100 bytes
+            'max_age' => 60, // Don't prune by age
+        ]);
+
+        $cache->prune();
+
+        // Old file should be deleted, new file should remain
+        $this->assertFileDoesNotExist("{$this->cachePath}/old");
+        $this->assertFileExists("{$this->cachePath}/new");
     }
 }
