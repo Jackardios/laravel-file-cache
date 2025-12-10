@@ -59,8 +59,10 @@ interface FileCache
 
     /**
      * Remove cached files that are too old or exceed the maximum cache size.
+     *
+     * @return array{deleted: int, remaining: int, total_size: int} Statistics about pruning operation
      */
-    public function prune(): void;
+    public function prune(): array;
 
     /**
      * Delete all unused cached files.
