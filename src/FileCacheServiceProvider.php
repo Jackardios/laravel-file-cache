@@ -19,15 +19,9 @@ class FileCacheServiceProvider extends ServiceProvider
             __DIR__.'/config/file-cache.php' => base_path('config/file-cache.php'),
         ], 'config');
 
-        if (method_exists($this->app, 'booted')) {
-            // Wait for Laravel to boot before adding the scheduled event.
-            // See: https://stackoverflow.com/a/36630136/1796523
-            $this->app->booted([$this, 'registerScheduledPruneCommand']);
-        } else {
-            // Lumen has no 'booted' method, but it works without, too, for some reason.
-            $this->registerScheduledPruneCommand($this->app);
-        }
-
+        // Wait for Laravel to boot before adding the scheduled event.
+        // See: https://stackoverflow.com/a/36630136/1796523
+        $this->app->booted([$this, 'registerScheduledPruneCommand']);
 
         $events->listen('cache:clearing', ClearFileCache::class);
     }
@@ -39,8 +33,8 @@ class FileCacheServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__.'/config/file-cache.php', 'file-cache');
 
-        $this->app->bind('file-cache', function () {
-            return new FileCache;
+        $this->app->singleton('file-cache', function ($app) {
+            return new FileCache($app['config']['file-cache'] ?? []);
         });
 
         $this->app->singleton('command.file-cache.prune', function ($app) {
@@ -55,18 +49,17 @@ class FileCacheServiceProvider extends ServiceProvider
     public function provides(): array
     {
         return [
+            'file-cache',
             'command.file-cache.prune',
         ];
     }
 
     /**
      * Register the scheduled command to prune the file cache.
-     *
-     * @param mixed $app Laravel or Lumen application instance.
      */
-    public function registerScheduledPruneCommand($app): void
+    public function registerScheduledPruneCommand(): void
     {
-        $app->make(Schedule::class)
+        $this->app->make(Schedule::class)
             ->command(PruneFileCache::class)
             ->cron(config('file-cache.prune_interval'));
     }
