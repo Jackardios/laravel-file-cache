@@ -2,6 +2,7 @@
 
 namespace Jackardios\FileCache\Testing;
 
+use Illuminate\Contracts\Foundation\Application;
 use Jackardios\FileCache\Contracts\File;
 use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
 use Illuminate\Filesystem\Filesystem;
@@ -10,7 +11,12 @@ class FileCacheFake implements FileCacheContract
 {
     protected string $path;
 
-    public function __construct()
+    /**
+     * Create a new fake file cache instance.
+     *
+     * @param Application|null $app Application instance (optional, for compatibility)
+     */
+    public function __construct(?Application $app = null)
     {
         (new Filesystem)->cleanDirectory(
             $root = storage_path('framework/testing/disks/file-cache')
@@ -24,6 +30,8 @@ class FileCacheFake implements FileCacheContract
      */
     public function get(File $file, ?callable $callback = null, bool $throwOnLock = false)
     {
+        $callback = $callback ?? static fn(File $file, string $path): string => $path;
+
         return $this->batch([$file], function ($files, $paths) use ($callback) {
             return call_user_func($callback, $files[0], $paths[0]);
         });
@@ -42,6 +50,8 @@ class FileCacheFake implements FileCacheContract
      */
     public function batch(array $files, ?callable $callback = null, bool $throwOnLock = false)
     {
+        $callback = $callback ?? static fn(array $files, array $paths): array => $paths;
+
         $paths = array_map(function ($file) {
             $hash = hash('sha256', $file->getUrl());
 
@@ -62,9 +72,9 @@ class FileCacheFake implements FileCacheContract
     /**
      * {@inheritdoc}
      */
-    public function prune(): void
+    public function prune(): array
     {
-        //
+        return ['deleted' => 0, 'remaining' => 0, 'total_size' => 0];
     }
 
     /**

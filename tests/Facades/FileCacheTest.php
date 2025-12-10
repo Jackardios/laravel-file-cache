@@ -26,7 +26,7 @@ class FileCacheTest extends TestCase
     public function testFake()
     {
         FileCache::fake();
-        $file = new GenericFile(1, 'https://example.com/image.jpg');
+        $file = new GenericFile('https://example.com/image.jpg');
         $path = FileCache::get($file, function ($file, $path) {
             return $path;
         });

@@ -2,6 +2,7 @@
 
 namespace Jackardios\FileCache;
 
+use InvalidArgumentException;
 use Jackardios\FileCache\Contracts\File;
 
 class GenericFile implements File
@@ -13,9 +14,23 @@ class GenericFile implements File
 
     /**
      * Create a new instance.
+     *
+     * @param string $url The file URL (http://, https://, or diskname://)
+     * @throws InvalidArgumentException If URL is empty or has invalid format
      */
     public function __construct(string $url)
     {
+        $url = trim($url);
+
+        if ($url === '') {
+            throw new InvalidArgumentException('File URL cannot be empty');
+        }
+
+        // URL must contain a protocol separator
+        if (!str_contains($url, '://')) {
+            throw new InvalidArgumentException('File URL must contain a protocol (e.g., http://, https://, or diskname://)');
+        }
+
         $this->url = $url;
     }
 

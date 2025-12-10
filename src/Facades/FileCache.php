@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\Facade;
  * @method static mixed getOnce(\Jackardios\FileCache\Contracts\File $file, ?callable $callback = null)
  * @method static mixed batch(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null)
  * @method static mixed batchOnce(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null)
- * @method static void prune()
+ * @method static array prune()
  * @method static void clear()
  *
  * @see \Jackardios\FileCache\FileCache;
