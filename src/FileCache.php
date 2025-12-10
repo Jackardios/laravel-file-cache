@@ -986,7 +986,7 @@ class FileCache implements FileCacheContract
      */
     protected function prepareConfig(array $config): array
     {
-        $fileCacheConfig = config('file-cache', []);
+        $fileCacheConfig = $this->loadLaravelConfig();
         $config = [
             'max_file_size' => -1, // any size (-1 = unlimited)
             'max_age' => 60, // 1 hour in minutes
@@ -1002,7 +1002,7 @@ class FileCache implements FileCacheContract
             'http_retries' => 0, // no retries by default
             'http_retry_delay' => 100, // 100ms between retries
             'batch_chunk_size' => 100, // chunk size for batch operations
-            'path' => storage_path('framework/cache/files'),
+            'path' => $this->getDefaultCachePath(),
             ...(is_array($fileCacheConfig) ? $fileCacheConfig : []),
             ...$config,
         ];
@@ -1077,6 +1077,30 @@ class FileCache implements FileCacheContract
 
         if ($config['batch_chunk_size'] < -1 || $config['batch_chunk_size'] === 0) {
             throw InvalidConfigurationException::create('batch_chunk_size', 'must be -1 (no limit) or a positive number');
+        }
+    }
+
+    /**
+     * Load configuration from Laravel's config system if available.
+     */
+    protected function loadLaravelConfig(): array
+    {
+        try {
+            return config('file-cache', []) ?: [];
+        } catch (\Throwable) {
+            return [];
+        }
+    }
+
+    /**
+     * Get the default cache path (Laravel storage or system temp).
+     */
+    protected function getDefaultCachePath(): string
+    {
+        try {
+            return storage_path('framework/cache/files');
+        } catch (\Throwable) {
+            return sys_get_temp_dir() . '/laravel-file-cache';
         }
     }
 

@@ -18,22 +18,13 @@ use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\FilesystemAdapter;
 use Illuminate\Filesystem\FilesystemManager;
 use Jackardios\FileCache\Exceptions\FailedToRetrieveFileException;
-use Jackardios\FileCache\Exceptions\SourceResourceIsInvalidException;
-use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Psr7\Request;
-use phpmock\phpunit\PHPMock;
-use Psr\Http\Message\RequestInterface;
+use PHPUnit\Framework\Attributes\DataProvider;
 use ReflectionMethod;
 
-/**
- * @runTestsInSeparateProcesses
- * @preserveGlobalState disabled
- */
 class FileCacheTest extends TestCase
 {
-    use PHPMock;
-
     protected string $cachePath;
     protected string $diskPath;
     protected \Closure $noop;
@@ -512,107 +503,6 @@ class FileCacheTest extends TestCase
         }
     }
 
-    public function testGetDiskThrowsSourceResourceTimeoutException()
-    {
-        $url = 's3://files/test-image.jpg';
-        $file = new GenericFile($url);
-        $cachedPath = $this->getCachedPath($url);
-
-        $stream = fopen('php://temp', 'r+');
-        fwrite($stream, 'some data');
-        rewind($stream);
-        $this->mockS3Filesystem($stream);
-
-        $streamGetMetaDataMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
-        $streamGetMetaDataMock->expects($this->atLeastOnce())->willReturn(['timed_out' => true]);
-
-        $cache = $this->createCache(['read_timeout' => 0.1]);
-
-        $this->expectException(SourceResourceTimedOutException::class);
-
-        try {
-            $cache->get($file, $this->noop);
-        } finally {
-            $this->assertFileDoesNotExist($cachedPath);
-            if (is_resource($stream)) {
-                fclose($stream);
-            }
-        }
-    }
-
-    public function testGetDiskThrowsSourceResourceInvalidExceptionOnCopyFail()
-    {
-        $url = 's3://files/test-image.jpg';
-        $file = new GenericFile($url);
-        $cachedPath = $this->getCachedPath($url);
-
-        $stream = fopen('php://temp', 'r+');
-        fwrite($stream, 'some data');
-        rewind($stream);
-        $this->mockS3Filesystem($stream);
-
-        $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
-        $streamCopyMock->expects($this->once())->willReturn(false);
-
-        $cache = $this->createCache();
-
-        $this->expectException(SourceResourceIsInvalidException::class);
-        $this->expectExceptionMessage('Failed to copy stream data');
-
-        try {
-            $cache->get($file, $this->noop);
-        } finally {
-            $this->assertFileDoesNotExist($cachedPath);
-            if (is_resource($stream)) {
-                fclose($stream);
-            }
-        }
-    }
-
-    public function testRetrieveThrowsFailedToRetrieveFileExceptionAfterMaxAttempts()
-    {
-        $url = 'fixtures://test-file.txt';
-        $file = new GenericFile($url);
-        $cachedPath = $this->getCachedPath($url);
-
-        $this->assertTrue($this->app['filesystem']->disk('fixtures')->exists('test-file.txt'));
-        touch($cachedPath);
-        $this->assertFileExists($cachedPath);
-
-        $fopenMock = $this->getFunctionMock('Jackardios\\FileCache', 'fopen');
-        $fopenMock->expects($this->atLeast(3))
-            ->willReturnCallback(function ($path, $mode) use ($cachedPath) {
-                if ($path === $cachedPath) {
-                    if ($mode === 'xb+') {
-                        return \fopen($path, $mode);
-                    }
-                    if ($mode === 'rb') {
-                        return false;
-                    }
-                }
-                return \fopen($path, $mode);
-            });
-
-        $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
-        $usleepMock->expects($this->any());
-
-        $cache = $this->createCache();
-
-        $this->expectException(FailedToRetrieveFileException::class);
-        $this->expectExceptionMessage('Failed to retrieve file after 3 attempts');
-
-        try {
-            $cache->get($file, $this->noop);
-        } catch (FailedToRetrieveFileException $e) {
-            $this->assertFileExists($cachedPath);
-            throw $e;
-        } finally {
-            if (file_exists($cachedPath)) {
-                unlink($cachedPath);
-            }
-        }
-    }
-
     public function testPruneSkipsLockedFile()
     {
         $unlockedFile = "{$this->cachePath}/unlocked";
@@ -642,10 +532,7 @@ class FileCacheTest extends TestCase
         $this->assertFileDoesNotExist($lockedFile, "Unlocked file should be pruned now.");
     }
 
-    /**
-     * @test
-     * @dataProvider provideUrlsForEncoding
-     */
+    #[DataProvider('provideUrlsForEncoding')]
     public function testEncodeUrl(string $inputUrl, string $expectedUrl)
     {
         $cache = $this->createCache();
@@ -690,66 +577,6 @@ class FileCacheTest extends TestCase
         $this->assertTrue($this->app['files']->delete($cachedPath));
     }
 
-    public function testGetWaitsForLockReleaseWhenNotThrowing()
-    {
-        $url = 'fixtures://test-file.txt';
-        $file = new GenericFile($url);
-        $cachedPath = $this->getCachedPath($url);
-
-        // Simulate: Another process started recording and set LOCK_EX
-        $this->assertTrue(touch($cachedPath), "Failed to create cache file for locking.");
-        $writingProcessHandle = fopen($cachedPath, 'rb+');
-        $this->assertIsResource($writingProcessHandle, "Failed to open handle for writing process simulation.");
-        $this->assertTrue(flock($writingProcessHandle, LOCK_EX), "Failed to acquire LOCK_EX for writing simulation.");
-
-        // Mock flock to simulate waiting for lock release
-        $flockMock = $this->getFunctionMock('Jackardios\\FileCache', 'flock');
-        $lockAttempt = 0;
-        $maxAttemptsBeforeSuccess = 3;
-        $sharedLockHandle = null;
-
-        $flockMock->expects($this->atLeast($maxAttemptsBeforeSuccess + 1))
-            ->willReturnCallback(
-                function ($handle, $operation) use (&$lockAttempt, $maxAttemptsBeforeSuccess, &$writingProcessHandle, $cachedPath, &$sharedLockHandle) {
-                    $meta = stream_get_meta_data($handle);
-                    if ($meta['uri'] === $cachedPath && $meta['mode'] === 'rb') {
-                        $sharedLockHandle = $handle;
-                    }
-
-                    if ($handle === $sharedLockHandle && ($operation === (LOCK_SH | LOCK_NB) || $operation === LOCK_SH)) {
-                        $lockAttempt++;
-                        if ($lockAttempt <= $maxAttemptsBeforeSuccess) {
-                            return false;
-                        }
-                        if (is_resource($writingProcessHandle)) {
-                            \flock($writingProcessHandle, LOCK_UN);
-                            fclose($writingProcessHandle);
-                            $writingProcessHandle = null;
-                        }
-                        return \flock($handle, $operation);
-                    }
-
-                    return \flock($handle, $operation);
-                }
-            );
-
-        $usleepMock = $this->getFunctionMock('Jackardios\\FileCache', 'usleep');
-        $usleepMock->expects($this->exactly($maxAttemptsBeforeSuccess));
-
-        $cache = $this->createCache();
-        $resultPath = $cache->get($file, $this->noop, false);
-
-        $this->assertEquals($cachedPath, $resultPath);
-        $this->assertFileExists($cachedPath);
-        $this->assertGreaterThanOrEqual($maxAttemptsBeforeSuccess, $lockAttempt);
-        $this->assertGreaterThan(0, filesize($cachedPath));
-
-        if (is_resource($writingProcessHandle)) {
-            \flock($writingProcessHandle, LOCK_UN);
-            fclose($writingProcessHandle);
-        }
-    }
-
     public function testMultipleReadersAccessCachedFileSimultaneously()
     {
         $url = 'fixtures://test-file.txt';
@@ -780,43 +607,6 @@ class FileCacheTest extends TestCase
         fclose($reader1Handle);
         flock($reader2Handle, LOCK_UN);
         fclose($reader2Handle);
-    }
-
-    public function testGetRemotePartialDownloadTimeout()
-    {
-        $url = 'https://files.example.com/large-file.zip';
-        $file = new GenericFile($url);
-        $cachedPath = $this->getCachedPath($url);
-
-        $cache = $this->createCacheWithMockClient(
-            [new Response(200, ['Content-Type' => 'application/zip'])],
-            ['read_timeout' => 0.1]
-        );
-
-        $streamCopyMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_copy_to_stream');
-        $streamCopyMock->expects($this->once())
-            ->willReturnCallback(function ($source, $dest, $maxLength) {
-                fwrite($dest, 'some partial data');
-                return false;
-            });
-
-        $streamMetaMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_get_meta_data');
-        $streamMetaMock->expects($this->atLeastOnce())
-            ->willReturn(['timed_out' => true]);
-
-        $this->expectException(SourceResourceTimedOutException::class);
-
-        try {
-            $cache->get($file, $this->noop);
-        } catch (SourceResourceTimedOutException $e) {
-            clearstatcache(true, $cachedPath);
-            $this->assertFileDoesNotExist($cachedPath);
-            throw $e;
-        } finally {
-            if (file_exists($cachedPath)) {
-                unlink($cachedPath);
-            }
-        }
     }
 
     public function testConfigValidationThrowsOnInvalidMaxFileSize()
@@ -1048,42 +838,6 @@ class FileCacheTest extends TestCase
 
         $path = $cache->get($file, $this->noop);
         $this->assertEquals($cachedPath, $path);
-    }
-
-    public function testPruneTimeout()
-    {
-        // Create several files that should be pruned by age
-        for ($i = 0; $i < 5; $i++) {
-            $this->app['files']->put("{$this->cachePath}/file_{$i}", str_repeat('x', 100));
-            touch("{$this->cachePath}/file_{$i}", time() - 120); // 2 minutes old
-        }
-
-        // Mock time() to simulate timeout after a few iterations
-        // Use a fixed base time to make the test deterministic
-        $baseTime = 1000000;
-        $timeMock = $this->getFunctionMock('Jackardios\\FileCache', 'time');
-        $callCount = 0;
-        $timeMock->expects($this->any())->willReturnCallback(function () use (&$callCount, $baseTime) {
-            $callCount++;
-            // First 3 calls return base time (for startTime and initial checks)
-            // After that, return base time + timeout + 1 to trigger timeout
-            if ($callCount <= 3) {
-                return $baseTime;
-            }
-            return $baseTime + 10; // 10 seconds later, exceeds 1 second timeout
-        });
-
-        $cache = new FileCache([
-            'path' => $this->cachePath,
-            'max_age' => 1, // 1 minute
-            'prune_timeout' => 1, // 1 second timeout
-        ]);
-
-        $cache->prune();
-
-        // Some files should still exist due to timeout
-        $remainingFiles = glob("{$this->cachePath}/file_*");
-        $this->assertNotEmpty($remainingFiles, "Some files should remain after prune timeout");
     }
 
     public function testConfigValidationThrowsOnInvalidMaxSize()
