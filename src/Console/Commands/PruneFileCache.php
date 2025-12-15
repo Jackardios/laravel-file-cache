@@ -12,7 +12,7 @@ class PruneFileCache extends Command
      *
      * @var string
      */
-    protected $signature = 'prune-file-cache {--quiet : Suppress output}';
+    protected $signature = 'prune-file-cache {--silent : Suppress output}';
 
     /**
      * The console command description.
@@ -28,7 +28,7 @@ class PruneFileCache extends Command
     {
         $stats = $cache->prune();
 
-        if (!$this->option('quiet')) {
+        if (!$this->option('silent')) {
             $this->info('File cache pruned successfully.');
             $this->line("  Deleted: {$stats['deleted']} files");
             $this->line("  Remaining: {$stats['remaining']} files");
