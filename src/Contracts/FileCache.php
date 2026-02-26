@@ -14,6 +14,8 @@ interface FileCache
      * file as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
+     * @throws \RuntimeException
+     *
      * @return mixed Result of the callback.
      */
     public function get(File $file, ?callable $callback = null, bool $throwOnLock = false);
@@ -26,6 +28,8 @@ interface FileCache
      * @param (callable(\Jackardios\FileCache\Contracts\File, string): mixed)|null $callback Gets the file object and the path to the cached file
      * file as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
+     *
+     * @throws \RuntimeException
      *
      * @return mixed Result of the callback.
      */
@@ -40,6 +44,8 @@ interface FileCache
      * to the cached file files (in the same ordering) as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
+     * @throws \RuntimeException
+     *
      * @return mixed Result of the callback.
      */
     public function batch(array $files, ?callable $callback = null, bool $throwOnLock = false);
@@ -53,6 +59,8 @@ interface FileCache
      * to the cached file files (in the same ordering) as arguments.
      * @param bool $throwOnLock Whether to throw an exception if a file is currently locked (i.e. written to). Otherwise the method will wait until the lock is released.
      *
+     * @throws \RuntimeException
+     *
      * @return mixed Result of the callback.
      */
     public function batchOnce(array $files, ?callable $callback = null, bool $throwOnLock = false);
@@ -60,12 +68,16 @@ interface FileCache
     /**
      * Remove cached files that are too old or exceed the maximum cache size.
      *
+     * @throws \RuntimeException
+     *
      * @return array{deleted: int, remaining: int, total_size: int} Statistics about pruning operation
      */
     public function prune(): array;
 
     /**
      * Delete all unused cached files.
+     *
+     * @throws \RuntimeException
      */
     public function clear(): void;
 
@@ -73,6 +85,12 @@ interface FileCache
      * Check if a file exists.
      *
      * @param \Jackardios\FileCache\Contracts\File $file
+     *
+     * @throws \GuzzleHttp\Exception\GuzzleException
+     * @throws \Jackardios\FileCache\Exceptions\FileIsTooLargeException
+     * @throws \Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException
+     * @throws \Jackardios\FileCache\Exceptions\HostNotAllowedException
+     * @throws \RuntimeException
      *
      * @return bool Whether the file exists or not.
      */

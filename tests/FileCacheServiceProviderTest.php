@@ -2,9 +2,7 @@
 
 namespace Jackardios\FileCache\Tests;
 
-use Jackardios\FileCache\FileCache;
 use Illuminate\Console\Scheduling\Schedule;
-use Illuminate\Support\Facades\Event;
 
 class FileCacheServiceProviderTest extends TestCase
 {
@@ -12,7 +10,16 @@ class FileCacheServiceProviderTest extends TestCase
     {
         config(['file-cache.prune_interval' => '*/5 * * * *']);
         $schedule = $this->app[Schedule::class];
-        $event = $schedule->events()[0];
+
+        $event = null;
+        foreach ($schedule->events() as $scheduledEvent) {
+            if (str_contains($scheduledEvent->command, 'prune-file-cache')) {
+                $event = $scheduledEvent;
+                break;
+            }
+        }
+
+        $this->assertNotNull($event, 'Scheduled prune-file-cache command was not registered.');
         $this->assertStringContainsString('prune-file-cache', $event->command);
         $this->assertEquals('*/5 * * * *', $event->expression);
     }

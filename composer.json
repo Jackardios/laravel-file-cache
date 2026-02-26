@@ -17,7 +17,8 @@
         "phpunit/phpunit": "^9.0 || ^10.0 || ^11.0",
         "mockery/mockery": "^1.2",
         "laravel/laravel": "^10.0 || ^11.0 || ^12.0",
-        "php-mock/php-mock-phpunit": "^2.13"
+        "php-mock/php-mock-phpunit": "^2.13",
+        "phpstan/phpstan": "^1.12"
     },
     "authors": [
         {
@@ -39,7 +40,9 @@
         ]
     },
     "scripts": {
-        "test": "./vendor/bin/phpunit"
+        "test": "./vendor/bin/phpunit",
+        "analyse": "./vendor/bin/phpstan analyse --no-progress --memory-limit=1G",
+        "test-coverage": "php -d pcov.enabled=1 ./vendor/bin/phpunit --coverage-text --colors=never"
     },
     "extra": {
         "laravel": {

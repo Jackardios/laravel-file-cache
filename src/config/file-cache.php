@@ -103,8 +103,17 @@ return [
     'http_retry_delay' => env('FILE_CACHE_HTTP_RETRY_DELAY', 100),
 
     /*
-     | Maximum number of files to process in a single batch to avoid
-     | file descriptor exhaustion. Set to -1 for no limit.
+     | Timeout to wait for lifecycle lock acquisition in seconds.
+     | This lock coordinates batch/batchOnce with prune/clear operations.
+     | Set to -1 to wait indefinitely.
+     | Default: 30 seconds
+     */
+    'lifecycle_lock_timeout' => env('FILE_CACHE_LIFECYCLE_LOCK_TIMEOUT', 30.0),
+
+    /*
+     | Maximum number of files to process in a single chunk during
+     | batch() and batchOnce() to avoid file descriptor exhaustion.
+     | Set to -1 for no limit.
      | Default: 100
      */
     'batch_chunk_size' => env('FILE_CACHE_BATCH_CHUNK_SIZE', 100),

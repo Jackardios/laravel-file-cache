@@ -55,3 +55,42 @@ jobs:
 
       - name: Run tests
         run: ./vendor/bin/phpunit
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: Quality (PHP 8.4, Laravel ^12.0)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: curl, mbstring
+          coverage: pcov
+
+      - name: Get Composer cache directory
+        id: composer-cache-quality
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache-quality.outputs.dir }}
+          key: quality-${{ runner.os }}-php-8.4-laravel-12-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            quality-${{ runner.os }}-php-8.4-laravel-12-
+
+      - name: Install dependencies
+        run: |
+          composer require --no-update laravel/laravel:^12.0
+          composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Run static analysis
+        run: composer analyse
+
+      - name: Run tests with coverage
+        run: composer test-coverage

@@ -9,13 +9,15 @@ class ClearFileCacheTest extends TestCase
     public function setUp(): void
     {
         parent::setUp();
-        $this->cachePath = sys_get_temp_dir().'/biigle_file_cache_test';
+        $this->cachePath = sys_get_temp_dir().'/biigle_file_cache_test_listener_'.uniqid('', true);
         $this->app['files']->makeDirectory($this->cachePath, 0755, false, true);
     }
 
     public function tearDown(): void
     {
-        $this->app['files']->deleteDirectory($this->cachePath);
+        if ($this->app['files']->exists($this->cachePath)) {
+            $this->app['files']->deleteDirectory($this->cachePath);
+        }
         parent::tearDown();
     }
 

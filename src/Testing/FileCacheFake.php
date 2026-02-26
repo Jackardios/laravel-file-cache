@@ -18,8 +18,10 @@ class FileCacheFake implements FileCacheContract
      */
     public function __construct(?Application $app = null)
     {
+        $storagePath = $app?->storagePath() ?? storage_path();
+
         (new Filesystem)->cleanDirectory(
-            $root = storage_path('framework/testing/disks/file-cache')
+            $root = "{$storagePath}/framework/testing/disks/file-cache"
         );
 
         $this->path = $root;

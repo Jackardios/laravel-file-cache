@@ -83,6 +83,10 @@ FileCache::getOnce($file, function ($file, $path) {
 $exists = FileCache::exists($file);
 ```
 
+For remote files, `exists()` uses the HTTP retry settings (`http_retries`, `http_retry_delay`).
+HTTP response statuses outside 2xx are treated as "not exists" (`false`), including when a custom Guzzle client uses `http_errors=true`.
+It may throw network/storage exceptions (for example connection errors or unknown disks).
+
 ## Configuration
 
 The file cache comes with a sensible default configuration. You can override it in the `file-cache` namespace or with environment variables.
@@ -178,6 +182,7 @@ Default: `0` (no retries)
 Environment: `FILE_CACHE_HTTP_RETRIES`
 
 Number of retry attempts for failed HTTP requests. Client errors (4xx except 429) are not retried.
+This applies to both `get()` and `exists()` for remote files.
 
 ### file-cache.http_retry_delay
 
@@ -186,12 +191,22 @@ Environment: `FILE_CACHE_HTTP_RETRY_DELAY`
 
 Delay between HTTP retry attempts in milliseconds.
 
+### file-cache.lifecycle_lock_timeout
+
+Default: `30` (seconds)
+Environment: `FILE_CACHE_LIFECYCLE_LOCK_TIMEOUT`
+
+Timeout to wait for lifecycle lock acquisition in seconds when coordinating `batch()`/`batchOnce()` with `prune()`/`clear()`.
+Set to `-1` to wait indefinitely.
+
 ### file-cache.batch_chunk_size
 
 Default: `100`
 Environment: `FILE_CACHE_BATCH_CHUNK_SIZE`
 
-Maximum number of files to process in a single batch to avoid file descriptor exhaustion. Set to `-1` for no limit.
+Maximum number of files to process in a single chunk during `batch()` and `batchOnce()`.
+Lower values reduce the number of simultaneously opened cached file streams and help avoid file descriptor exhaustion.
+Set to `-1` for no limit.
 
 ### file-cache.lock_max_attempts
 

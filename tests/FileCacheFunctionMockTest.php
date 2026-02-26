@@ -335,6 +335,93 @@ class FileCacheFunctionMockTest extends TestCase
         }
     }
 
+    public function testBatchChunkingClosesCachedStreamsBeforeCallback()
+    {
+        $files = [];
+        for ($i = 0; $i < 5; $i++) {
+            $files[] = new GenericFile('fixtures://test-file.txt');
+        }
+
+        $cache = $this->createCacheWithMockFixtures(['batch_chunk_size' => 2]);
+        $callbackStarted = false;
+        $cacheStreamClosedBeforeCallback = 0;
+        $cachePath = $this->cachePath;
+
+        $fcloseMock = $this->getFunctionMock('Jackardios\\FileCache', 'fclose');
+        $fcloseMock->expects($this->atLeastOnce())
+            ->willReturnCallback(function ($stream) use (&$callbackStarted, &$cacheStreamClosedBeforeCallback, $cachePath) {
+                $meta = stream_get_meta_data($stream);
+                $uri = $meta['uri'] ?? '';
+                if (!$callbackStarted && str_starts_with($uri, $cachePath . '/')) {
+                    $cacheStreamClosedBeforeCallback++;
+                }
+
+                return \fclose($stream);
+            });
+
+        $cache->batch($files, function () use (&$callbackStarted) {
+            $callbackStarted = true;
+            return null;
+        });
+
+        $this->assertGreaterThan(
+            0,
+            $cacheStreamClosedBeforeCallback,
+            'Chunked batch should close cached file streams before entering the callback.'
+        );
+    }
+
+    public function testBatchOnceChunkingClosesCachedStreamsBeforeCallback()
+    {
+        $files = [];
+        for ($i = 0; $i < 5; $i++) {
+            $files[] = new GenericFile('fixtures://test-file.txt');
+        }
+
+        $cache = $this->createCacheWithMockFixtures(['batch_chunk_size' => 2]);
+        $callbackStarted = false;
+        $cacheStreamClosedBeforeCallback = 0;
+        $cachePath = $this->cachePath;
+
+        $fcloseMock = $this->getFunctionMock('Jackardios\\FileCache', 'fclose');
+        $fcloseMock->expects($this->atLeastOnce())
+            ->willReturnCallback(function ($stream) use (&$callbackStarted, &$cacheStreamClosedBeforeCallback, $cachePath) {
+                $meta = stream_get_meta_data($stream);
+                $uri = $meta['uri'] ?? '';
+                if (!$callbackStarted && str_starts_with($uri, $cachePath . '/')) {
+                    $cacheStreamClosedBeforeCallback++;
+                }
+
+                return \fclose($stream);
+            });
+
+        $cache->batchOnce($files, function () use (&$callbackStarted) {
+            $callbackStarted = true;
+            return null;
+        });
+
+        $this->assertGreaterThan(
+            0,
+            $cacheStreamClosedBeforeCallback,
+            'Chunked batchOnce should close cached file streams before entering the callback.'
+        );
+    }
+
+    public function testLifecycleLockTimeout()
+    {
+        $cache = $this->createCacheWithMockFixtures([
+            'lifecycle_lock_timeout' => 0,
+        ]);
+
+        $flockMock = $this->getFunctionMock('Jackardios\\FileCache', 'flock');
+        $flockMock->expects($this->atLeastOnce())->willReturn(false);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('lifecycle lock');
+
+        $cache->batch([]);
+    }
+
     public function testPruneTimeout()
     {
         // Create several files that should be pruned by age
