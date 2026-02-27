@@ -9,10 +9,10 @@ use Jackardios\FileCache\Exceptions\FailedToRetrieveFileException;
 use Jackardios\FileCache\Exceptions\FileIsTooLargeException;
 use Jackardios\FileCache\Exceptions\FileLockedException;
 use Jackardios\FileCache\Exceptions\HostNotAllowedException;
-use Jackardios\FileCache\Exceptions\InvalidConfigurationException;
 use Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException;
 use Jackardios\FileCache\Exceptions\SourceResourceIsInvalidException;
 use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
+use Jackardios\FileCache\Support\ConfigNormalizer;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Exception;
@@ -29,9 +29,49 @@ use Symfony\Component\Finder\Finder;
 
 /**
  * The file cache.
+ *
+ * @phpstan-type RetrievedFile array{path: string, stream: resource}
+ * @phpstan-type NormalizedConfig array{
+ *   max_file_size: int,
+ *   max_age: int,
+ *   max_size: int,
+ *   lock_max_attempts: int,
+ *   lock_wait_timeout: float,
+ *   timeout: float,
+ *   connect_timeout: float,
+ *   read_timeout: float,
+ *   prune_timeout: int,
+ *   mime_types: array<int, string>,
+ *   allowed_hosts: array<int, string>|null,
+ *   http_retries: int,
+ *   http_retry_delay: int,
+ *   lifecycle_lock_timeout: float,
+ *   batch_chunk_size: int,
+ *   path: string
+ * }
  */
 class FileCache implements FileCacheContract
 {
+    /**
+     * @var NormalizedConfig
+     */
+    protected array $config;
+
+    /**
+     * HTTP client used for remote file operations.
+     */
+    protected Client $client;
+
+    /**
+     * Filesystem helper.
+     */
+    protected Filesystem $files;
+
+    /**
+     * Filesystem manager for storage disks.
+     */
+    protected FilesystemManager $storage;
+
     /**
      * Logger instance for diagnostic logging.
      */
@@ -39,19 +79,41 @@ class FileCache implements FileCacheContract
 
     /**
      * Create an instance.
+     *
+     * @param array<string, mixed> $config
      */
     public function __construct(
-        protected array $config = [],
-        protected ?Client $client = null,
-        protected ?Filesystem $files = null,
-        protected ?FilesystemManager $storage = null,
+        array $config = [],
+        ?Client $client = null,
+        ?Filesystem $files = null,
+        ?FilesystemManager $storage = null,
         ?LoggerInterface $logger = null
     ) {
-        $this->config = $this->prepareConfig($config);
-        $this->client = $client ?: $this->makeHttpClient();
-        $this->files = $files ?: app('files');
-        $this->storage = $storage ?: app('filesystem');
+        $this->config = ConfigNormalizer::normalize($config);
+        $this->client = $client ?? $this->makeHttpClient();
+        $this->files = $files ?? $this->resolveFilesystem();
+        $this->storage = $storage ?? $this->resolveFilesystemManager();
         $this->logger = $logger ?: new NullLogger();
+    }
+
+    protected function resolveFilesystem(): Filesystem
+    {
+        $files = app('files');
+        if (!$files instanceof Filesystem) {
+            throw new RuntimeException('The "files" service must resolve to Illuminate\\Filesystem\\Filesystem.');
+        }
+
+        return $files;
+    }
+
+    protected function resolveFilesystemManager(): FilesystemManager
+    {
+        $filesystem = app('filesystem');
+        if (!$filesystem instanceof FilesystemManager) {
+            throw new RuntimeException('The "filesystem" service must resolve to Illuminate\\Filesystem\\FilesystemManager.');
+        }
+
+        return $filesystem;
     }
 
     /**
@@ -83,7 +145,7 @@ class FileCache implements FileCacheContract
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultGetCallback']);
 
         return $this->batch([$file], function ($files, $paths) use ($callback) {
-            return call_user_func($callback, $files[0], $paths[0]);
+            return $callback($files[0], $paths[0]);
         }, $throwOnLock);
     }
 
@@ -103,12 +165,14 @@ class FileCache implements FileCacheContract
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultGetCallback']);
 
         return $this->batchOnce([$file], function ($files, $paths) use ($callback) {
-            return call_user_func($callback, $files[0], $paths[0]);
+            return $callback($files[0], $paths[0]);
         }, $throwOnLock);
     }
 
     /**
      * {@inheritdoc}
+     *
+     * @param array<int, File> $files
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
@@ -121,26 +185,60 @@ class FileCache implements FileCacheContract
     public function batch(array $files, ?callable $callback = null, bool $throwOnLock = false)
     {
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultBatchCallback']);
+
+        return $this->runBatchRetrieval($files, $callback, $throwOnLock);
+    }
+
+    /**
+     * Retrieve all files for batch-like operations under a shared lifecycle lock.
+     *
+     * @param array<int, File> $files
+     * @param callable(array<int, File>, array<int, string>): mixed $callback
+     * @param array<int, string> $processedPaths
+     * @return mixed
+     */
+    protected function runBatchRetrieval(
+        array $files,
+        callable $callback,
+        bool $throwOnLock,
+        array &$processedPaths = []
+    ) {
+        return $this->withLifecycleSharedLock(function () use ($files, $callback, $throwOnLock, &$processedPaths) {
+            return $this->runBatchByChunkStrategy($files, $callback, $throwOnLock, $processedPaths);
+        });
+    }
+
+    /**
+     * Execute batch processing using either direct or chunked strategy.
+     *
+     * @param array<int, File> $files
+     * @param callable(array<int, File>, array<int, string>): mixed $callback
+     * @param array<int, string> $processedPaths
+     * @return mixed
+     */
+    protected function runBatchByChunkStrategy(
+        array $files,
+        callable $callback,
+        bool $throwOnLock,
+        array &$processedPaths = []
+    ) {
         $chunkSize = $this->config['batch_chunk_size'];
 
-        return $this->withLifecycleSharedLock(function () use ($files, $callback, $throwOnLock, $chunkSize) {
-            $processedPaths = [];
+        if ($chunkSize < 0 || count($files) <= $chunkSize) {
+            return $this->processBatch($files, $callback, $throwOnLock, $processedPaths);
+        }
 
-            if ($chunkSize < 0 || count($files) <= $chunkSize) {
-                return $this->processBatch($files, $callback, $throwOnLock, $processedPaths);
-            }
-
-            return $this->processBatchChunked($files, $callback, $throwOnLock, $chunkSize, $processedPaths);
-        });
+        /** @var int<1, max> $chunkSize */
+        return $this->processBatchChunked($files, $callback, $throwOnLock, $chunkSize, $processedPaths);
     }
 
     /**
      * Process files in chunks to limit concurrently opened cached file streams.
      *
-     * @param array $files
-     * @param callable $callback
-     * @param bool $throwOnLock
-     * @param int $chunkSize
+     * @param array<int, File> $files
+     * @param callable(array<int, File>, array<int, string>): mixed $callback
+     * @param array<int, string> $processedPaths
+     * @param int<1, max> $chunkSize
      * @return mixed
      */
     protected function processBatchChunked(
@@ -151,10 +249,13 @@ class FileCache implements FileCacheContract
         array &$processedPaths = []
     )
     {
+        /** @var array<int, string> $allPaths */
         $allPaths = [];
+        /** @var array<int, array<int, File>> $chunks */
         $chunks = array_chunk($files, $chunkSize, true);
 
         foreach ($chunks as $chunkFiles) {
+            /** @var array<int, RetrievedFile> $chunkRetrieved */
             $chunkRetrieved = [];
 
             try {
@@ -165,13 +266,14 @@ class FileCache implements FileCacheContract
                 }
             } finally {
                 foreach ($chunkRetrieved as $retrievedFile) {
-                    if (isset($retrievedFile['stream']) && is_resource($retrievedFile['stream'])) {
+                    if (is_resource($retrievedFile['stream'])) {
                         fclose($retrievedFile['stream']);
                     }
                 }
             }
         }
 
+        /** @var array<int, string> $paths */
         $paths = [];
         foreach ($files as $index => $_file) {
             if (isset($allPaths[$index])) {
@@ -179,40 +281,34 @@ class FileCache implements FileCacheContract
             }
         }
 
-        return call_user_func($callback, $files, $paths);
+        return $callback($files, $paths);
     }
 
     /**
      * Process a batch of files (internal implementation).
      *
-     * @param array $files
-     * @param callable|null $callback
-     * @param bool $throwOnLock
-     * @param array $processedPaths Filled with cached paths that were successfully retrieved
+     * @param array<int, File> $files
+     * @param callable(array<int, File>, array<int, string>): mixed $callback
+     * @param array<int, string> $processedPaths Filled with cached paths that were successfully retrieved
      * @return mixed
      */
-    protected function processBatch(array $files, ?callable $callback, bool $throwOnLock, array &$processedPaths = [])
+    protected function processBatch(array $files, callable $callback, bool $throwOnLock, array &$processedPaths = [])
     {
-        $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultBatchCallback']);
-
+        /** @var array<int, RetrievedFile> $retrieved */
         $retrieved = [];
         try {
-            // Use explicit loop instead of array_map to properly handle exceptions
-            // and close already-opened streams if an exception occurs mid-batch
             foreach ($files as $index => $file) {
                 $retrieved[$index] = $this->retrieve($file, $throwOnLock);
                 $processedPaths[$index] = $retrieved[$index]['path'];
             }
 
-            $paths = array_map(static function ($file) {
-                return $file['path'];
-            }, $retrieved);
+            /** @var array<int, string> $paths */
+            $paths = array_map(static fn(array $file): string => $file['path'], $retrieved);
 
-            return call_user_func($callback, $files, $paths);
+            return $callback($files, $paths);
         } finally {
-            // Close streams
             foreach ($retrieved as $file) {
-                if (!isset($file['stream']) || !is_resource($file['stream'])) {
+                if (!is_resource($file['stream'])) {
                     continue;
                 }
                 fclose($file['stream']);
@@ -234,20 +330,14 @@ class FileCache implements FileCacheContract
     public function batchOnce(array $files, ?callable $callback = null, bool $throwOnLock = false)
     {
         $callback = $callback ?? \Closure::fromCallable([static::class, 'defaultBatchCallback']);
-        $chunkSize = $this->config['batch_chunk_size'];
+        /** @var array<int, string> $processedPaths */
         $processedPaths = [];
         $result = null;
         $capturedException = null;
         $cleanupException = null;
 
         try {
-            $result = $this->withLifecycleSharedLock(function () use ($files, $callback, $throwOnLock, $chunkSize, &$processedPaths) {
-                if ($chunkSize < 0 || count($files) <= $chunkSize) {
-                    return $this->processBatch($files, $callback, $throwOnLock, $processedPaths);
-                }
-
-                return $this->processBatchChunked($files, $callback, $throwOnLock, $chunkSize, $processedPaths);
-            });
+            $result = $this->runBatchRetrieval($files, $callback, $throwOnLock, $processedPaths);
         } catch (\Throwable $exception) {
             $capturedException = $exception;
         }
@@ -287,7 +377,8 @@ class FileCache implements FileCacheContract
      */
     public function prune(): array
     {
-        return $this->withLifecycleExclusiveLock(function () {
+        /** @var array{deleted: int, remaining: int, total_size: int} $stats */
+        $stats = $this->withLifecycleExclusiveLock(function (): array {
             $stats = ['deleted' => 0, 'remaining' => 0, 'total_size' => 0];
 
             if (!$this->files->exists($this->config['path'])) {
@@ -300,7 +391,6 @@ class FileCache implements FileCacheContract
             $allowedAge = $this->config['max_age'] * 60;
             $allowedSize = $this->config['max_size'];
 
-            // Collect all files with their metadata in a single pass
             $fileInfos = [];
             $files = Finder::create()
                 ->files()
@@ -321,18 +411,16 @@ class FileCache implements FileCacheContract
                         'size' => $file->getSize(),
                     ];
                 } catch (RuntimeException $e) {
-                    // File might have been deleted, skip it
                     continue;
                 }
             }
 
-            // Sort by access time (oldest first) for both age and size-based pruning
             usort($fileInfos, static fn($a, $b) => $a['atime'] <=> $b['atime']);
 
             $totalSize = 0;
+            $remainingCount = 0;
             $remainingFiles = [];
 
-            // First pass: prune by age, collect remaining files
             foreach ($fileInfos as $info) {
                 if ($this->isPruneTimedOut($startTime, $timeout, 'age-based pruning')) {
                     return $stats;
@@ -345,12 +433,11 @@ class FileCache implements FileCacheContract
                     continue;
                 }
 
-                // File was not deleted (either not expired or locked)
                 $totalSize += $info['size'];
+                $remainingCount++;
                 $remainingFiles[] = $info;
             }
 
-            // Second pass: prune by size if needed (files already sorted by atime)
             if ($totalSize > $allowedSize) {
                 foreach ($remainingFiles as $info) {
                     if ($totalSize <= $allowedSize) {
@@ -364,22 +451,18 @@ class FileCache implements FileCacheContract
                     if ($this->delete($info['file'])) {
                         $totalSize -= $info['size'];
                         $stats['deleted']++;
-                    } else {
-                        $stats['remaining']++;
+                        $remainingCount--;
                     }
                 }
             }
 
             $stats['total_size'] = $totalSize;
-            $stats['remaining'] = 0;
-            foreach ($remainingFiles as $info) {
-                if ($this->files->exists($info['file']->getRealPath())) {
-                    $stats['remaining']++;
-                }
-            }
+            $stats['remaining'] = $remainingCount;
 
             return $stats;
         });
+
+        return $stats;
     }
 
     /**
@@ -488,7 +571,7 @@ class FileCache implements FileCacheContract
         }
 
         try {
-            return call_user_func($callback);
+            return $callback();
         } finally {
             flock($lockStream, LOCK_UN);
             fclose($lockStream);
@@ -590,7 +673,51 @@ class FileCache implements FileCacheContract
     protected function extractHttpStatusCode(GuzzleException $exception): int
     {
         if ($exception instanceof RequestException && $exception->hasResponse()) {
-            return $exception->getResponse()->getStatusCode();
+            $response = $exception->getResponse();
+            if ($response !== null) {
+                return $response->getStatusCode();
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Determine whether a failed HTTP request should be retried.
+     */
+    protected function shouldRetryHttpFailure(int $attempt, int $maxRetries, int $statusCode): bool
+    {
+        return $attempt <= $maxRetries && $this->shouldRetryHttpStatus($statusCode);
+    }
+
+    /**
+     * Log and delay before next HTTP retry attempt.
+     *
+     * @param array<string, mixed> $context
+     */
+    protected function backoffHttpRetry(
+        File $file,
+        string $method,
+        int $attempt,
+        int $maxRetries,
+        int $retryDelay,
+        array $context = []
+    ): void {
+        $this->logger->warning("HTTP {$method} request failed, retrying ({$attempt}/{$maxRetries})", [
+            'url' => $file->getUrl(),
+            ...$context,
+        ]);
+
+        usleep($retryDelay * 1000);
+    }
+
+    /**
+     * Extract HTTP status code from a retrieval exception message.
+     */
+    protected function extractRetrieveFailureStatusCode(FailedToRetrieveFileException $exception): int
+    {
+        if (preg_match('/status code (\d+)/', $exception->getMessage(), $matches) === 1) {
+            return (int) $matches[1];
         }
 
         return 0;
@@ -617,16 +744,13 @@ class FileCache implements FileCacheContract
                 $response = $this->client->head($this->encodeUrl($file->getUrl()));
                 $code = $response->getStatusCode();
 
-                if ($this->shouldRetryHttpStatus($code) && $attempt <= $maxRetries) {
-                    $this->logger->warning("HTTP HEAD request failed, retrying ({$attempt}/{$maxRetries})", [
-                        'url' => $file->getUrl(),
-                        'status_code' => $code,
-                    ]);
-                    usleep($retryDelay * 1000);
-                    continue;
-                }
-
                 if ($code < 200 || $code >= 300) {
+                    if ($this->shouldRetryHttpFailure($attempt, $maxRetries, $code)) {
+                        $this->backoffHttpRetry($file, 'HEAD', $attempt, $maxRetries, $retryDelay, [
+                            'status_code' => $code,
+                        ]);
+                        continue;
+                    }
                     return false;
                 }
 
@@ -653,28 +777,24 @@ class FileCache implements FileCacheContract
                 // Respect bool semantics for exists() when the client is configured
                 // with http_errors=true and Guzzle throws for HTTP 4xx/5xx responses.
                 if ($statusCode >= 400) {
-                    if ($this->shouldRetryHttpStatus($statusCode) && $attempt <= $maxRetries) {
-                        $this->logger->warning("HTTP HEAD request failed, retrying ({$attempt}/{$maxRetries})", [
-                            'url' => $file->getUrl(),
+                    if ($this->shouldRetryHttpFailure($attempt, $maxRetries, $statusCode)) {
+                        $this->backoffHttpRetry($file, 'HEAD', $attempt, $maxRetries, $retryDelay, [
                             'status_code' => $statusCode,
                             'exception' => $exception->getMessage(),
                         ]);
-                        usleep($retryDelay * 1000);
                         continue;
                     }
 
                     return false;
                 }
 
-                if (!$this->shouldRetryHttpStatus($statusCode) || $attempt > $maxRetries) {
+                if (!$this->shouldRetryHttpFailure($attempt, $maxRetries, $statusCode)) {
                     throw $exception;
                 }
 
-                $this->logger->warning("HTTP HEAD request failed, retrying ({$attempt}/{$maxRetries})", [
-                    'url' => $file->getUrl(),
+                $this->backoffHttpRetry($file, 'HEAD', $attempt, $maxRetries, $retryDelay, [
                     'exception' => $exception->getMessage(),
                 ]);
-                usleep($retryDelay * 1000);
             }
         }
 
@@ -703,6 +823,9 @@ class FileCache implements FileCacheContract
 
         if (!empty($this->config['mime_types'])) {
             $type = $disk->mimeType($urlWithoutProtocol);
+            if (!is_string($type)) {
+                $type = '(unknown)';
+            }
             if (!in_array($type, $this->config['mime_types'], true)) {
                 throw MimeTypeIsNotAllowedException::create($type);
             }
@@ -740,19 +863,14 @@ class FileCache implements FileCacheContract
         try {
             $fileStream = @fopen($filePath, 'rb');
             if ($fileStream === false) {
-                // Cannot open file - it's already deleted or inaccessible
-                // Consider it successfully "deleted" for pruning purposes
                 return !file_exists($filePath);
             }
 
-            // Only delete the file if it is not currently used. Else move on.
-            // Use non-blocking to avoid deadlocks
             if (flock($fileStream, LOCK_EX | LOCK_NB)) {
                 $this->files->delete($filePath);
                 $deleted = true;
             }
         } catch (Exception $e) {
-            // Ignore exceptions when deleting cache files
             return false;
         } finally {
             if (is_resource($fileStream)) {
@@ -768,8 +886,7 @@ class FileCache implements FileCacheContract
      * the cached file. If the file is local, nothing will be done and the path to the
      * local file will be returned.
      *
-     * @return array Containing the 'path' to the file and the file 'stream'. Close the
-     * stream when finished.
+     * @return RetrievedFile Containing the 'path' to the file and the file 'stream'. Close the stream when finished.
      * @throws GuzzleException
      * @throws FileNotFoundException
      * @throws FileIsTooLargeException
@@ -788,96 +905,129 @@ class FileCache implements FileCacheContract
         while ($attempt < $this->config['lock_max_attempts']) {
             $attempt++;
 
-            // This will return false if the file already exists. Else it will create it in
-            // read and write mode.
             $cachedFileStream = @fopen($cachedPath, 'xb+');
 
-            if ($cachedFileStream === false) {
-                // The file exists, try to get the file stream in read mode.
-                $cachedFileStream = @fopen($cachedPath, 'rb');
-
-                // If we can't open the file, it might be in a bad state or being deleted
-                if ($cachedFileStream === false) {
-                    // Wait a moment before retrying
-                    usleep(100000); // 100ms
-                    continue;
+            if (is_resource($cachedFileStream)) {
+                $newlyRetrieved = $this->retrieveByCreatingCacheFile($file, $cachedPath, $cachedFileStream);
+                if ($newlyRetrieved !== null) {
+                    return $newlyRetrieved;
                 }
-
-                if ($throwOnLock && !flock($cachedFileStream, LOCK_SH | LOCK_NB)) {
-                    fclose($cachedFileStream);
-                    throw FileLockedException::create();
-                }
-
-                // Wait for any LOCK_EX that is set if the file is currently written.
-                $lockAcquired = false;
-                $startTime = microtime(true);
-                $lockTimeout = $this->config['lock_wait_timeout'];
-                $hasLockTimeout = $lockTimeout >= 0;
-
-                while (!$lockAcquired) {
-                    $lockAcquired = flock($cachedFileStream, LOCK_SH | LOCK_NB);
-
-                    // Check timeout (-1 means wait indefinitely)
-                    if ($hasLockTimeout && (microtime(true) - $startTime) >= $lockTimeout) {
-                        break;
-                    }
-
-                    if (!$lockAcquired) {
-                        usleep(50000); // 50ms
-                    }
-                }
-
-                if (!$lockAcquired) {
-                    // Could not acquire lock in the given time
-                    fclose($cachedFileStream);
-                    continue;
-                }
-
-                $stat = fstat($cachedFileStream);
-                // Check if the file is still there since the writing operation could have
-                // failed. If the file is gone, retry retrieve.
-                if ($stat['nlink'] === 0) {
-                    fclose($cachedFileStream);
-                    continue;
-                }
-
-                // File caching may have failed and left an empty file in the cache.
-                // Delete the empty file and try to cache the file again.
-                if ($stat['size'] === 0) {
-                    fclose($cachedFileStream);
-                    $this->delete(new SplFileInfo($cachedPath));
-                    continue;
-                }
-
-                // The file exists and is no longer written to.
-                return $this->retrieveExistingFile($cachedPath, $cachedFileStream);
-            }
-
-            // The file did not exist and should be written. Hold LOCK_EX until writing
-            // finished.
-            if (!flock($cachedFileStream, LOCK_EX | LOCK_NB)) {
-                // Should not happen as we just created the file, but just in case
-                fclose($cachedFileStream);
-                @unlink($cachedPath);
                 continue;
             }
 
-            try {
-                $fileInfo = $this->retrieveNewFile($file, $cachedPath, $cachedFileStream);
-                // Convert the lock so other workers can use the file from now on.
-                flock($cachedFileStream, LOCK_SH);
-                return $fileInfo;
-            } catch (\Throwable $exception) {
-                // Remove the empty file if writing failed. This is the case that is caught
-                // by 'nlink' === 0 above.
-                fclose($cachedFileStream);
-                @unlink($cachedPath);
-
-                throw $exception;
+            $existingRetrieved = $this->retrieveFromExistingCache($cachedPath, $throwOnLock);
+            if ($existingRetrieved !== null) {
+                return $existingRetrieved;
             }
         }
 
         throw FailedToRetrieveFileException::create("Failed to retrieve file after {$this->config['lock_max_attempts']} attempts");
+    }
+
+    /**
+     * Read and validate a file that already exists in cache.
+     *
+     * @return RetrievedFile|null
+     */
+    protected function retrieveFromExistingCache(string $cachedPath, bool $throwOnLock): ?array
+    {
+        $cachedFileStream = @fopen($cachedPath, 'rb');
+
+        if ($cachedFileStream === false) {
+            usleep(100000); // 100ms
+            return null;
+        }
+
+        $closeStream = true;
+
+        try {
+            if (!$this->acquireSharedReadLock($cachedFileStream, $throwOnLock)) {
+                return null;
+            }
+
+            $stat = fstat($cachedFileStream);
+            if (!is_array($stat)) {
+                return null;
+            }
+
+            if ($stat['nlink'] === 0) {
+                return null;
+            }
+
+            if ($stat['size'] === 0) {
+                fclose($cachedFileStream);
+                $closeStream = false;
+                $this->delete(new SplFileInfo($cachedPath));
+                return null;
+            }
+
+            $closeStream = false;
+            return $this->retrieveExistingFile($cachedPath, $cachedFileStream);
+        } finally {
+            if ($closeStream && is_resource($cachedFileStream)) {
+                fclose($cachedFileStream);
+            }
+        }
+    }
+
+    /**
+     * Acquire a shared lock on cached file stream.
+     *
+     * @param resource $cachedFileStream
+     *
+     * @throws FileLockedException
+     */
+    protected function acquireSharedReadLock($cachedFileStream, bool $throwOnLock): bool
+    {
+        if ($throwOnLock && !flock($cachedFileStream, LOCK_SH | LOCK_NB)) {
+            throw FileLockedException::create();
+        }
+
+        $lockAcquired = false;
+        $startTime = microtime(true);
+        $lockTimeout = $this->config['lock_wait_timeout'];
+        $hasLockTimeout = $lockTimeout >= 0;
+
+        while (!$lockAcquired) {
+            $lockAcquired = flock($cachedFileStream, LOCK_SH | LOCK_NB);
+
+            if ($hasLockTimeout && (microtime(true) - $startTime) >= $lockTimeout) {
+                return false;
+            }
+
+            if (!$lockAcquired) {
+                usleep(50000); // 50ms
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Retrieve a file by creating a new cache entry.
+     *
+     * @param resource $cachedFileStream
+     *
+     * @return RetrievedFile|null
+     */
+    protected function retrieveByCreatingCacheFile(File $file, string $cachedPath, $cachedFileStream): ?array
+    {
+        if (!flock($cachedFileStream, LOCK_EX | LOCK_NB)) {
+            fclose($cachedFileStream);
+            @unlink($cachedPath);
+            return null;
+        }
+
+        try {
+            $fileInfo = $this->retrieveNewFile($file, $cachedPath, $cachedFileStream);
+            flock($cachedFileStream, LOCK_SH);
+            return $fileInfo;
+        } catch (\Throwable $exception) {
+            fclose($cachedFileStream);
+            @unlink($cachedPath);
+
+            throw $exception;
+        }
     }
 
     /**
@@ -886,12 +1036,10 @@ class FileCache implements FileCacheContract
      * @param string $cachedPath
      * @param resource $cachedFileStream
      *
-     * @return array
+     * @return RetrievedFile
      */
     protected function retrieveExistingFile(string $cachedPath, $cachedFileStream): array
     {
-        // Update access and modification time to signal that this cached file was
-        // used recently.
         if (!@touch($cachedPath)) {
             $this->logger->warning('Failed to update access time for cached file', [
                 'path' => $cachedPath,
@@ -912,7 +1060,7 @@ class FileCache implements FileCacheContract
      * @param string $cachedPath
      * @param resource $cachedFileStream
      *
-     * @return array
+     * @return RetrievedFile
      *
      * @throws GuzzleException
      * @throws FileNotFoundException
@@ -928,8 +1076,6 @@ class FileCache implements FileCacheContract
         } else {
             $newCachedPath = $this->getDiskFile($file, $cachedFileStream);
 
-            // If it is a locally stored file, delete the empty "placeholder"
-            // file again. The stream may stay open; it doesn't matter.
             if ($newCachedPath !== $cachedPath) {
                 @unlink($cachedPath);
             }
@@ -939,6 +1085,9 @@ class FileCache implements FileCacheContract
 
         if (!empty($this->config['mime_types'])) {
             $type = $this->files->mimeType($cachedPath);
+            if (!is_string($type)) {
+                $type = '(unknown)';
+            }
             if (!in_array($type, $this->config['mime_types'], true)) {
                 throw MimeTypeIsNotAllowedException::create($type);
             }
@@ -992,45 +1141,33 @@ class FileCache implements FileCacheContract
                 }
 
                 $statusCode = $this->extractHttpStatusCode($exception);
-                if (!$this->shouldRetryHttpStatus($statusCode)) {
+                if (!$this->shouldRetryHttpFailure($attempt, $maxRetries, $statusCode)) {
                     throw $exception;
                 }
 
-                if ($attempt <= $maxRetries) {
-                    $this->logger->warning("HTTP request failed, retrying ({$attempt}/{$maxRetries})", [
-                        'url' => $file->getUrl(),
-                        'exception' => $exception->getMessage(),
-                    ]);
-                    usleep($retryDelay * 1000);
-                    continue;
+                $context = ['exception' => $exception->getMessage()];
+                if ($statusCode > 0) {
+                    $context['status_code'] = $statusCode;
                 }
-
-                throw $exception;
+                $this->backoffHttpRetry($file, 'GET', $attempt, $maxRetries, $retryDelay, $context);
+                continue;
             } catch (FailedToRetrieveFileException $exception) {
                 $lastException = $exception;
+                $statusCode = $this->extractRetrieveFailureStatusCode($exception);
 
-                // Extract status code from message for retry decision
-                if (preg_match('/status code (\d+)/', $exception->getMessage(), $matches)) {
-                    $statusCode = (int) $matches[1];
-                    if (!$this->shouldRetryHttpStatus($statusCode)) {
-                        throw $exception;
-                    }
+                if (!$this->shouldRetryHttpFailure($attempt, $maxRetries, $statusCode)) {
+                    throw $exception;
                 }
 
-                if ($attempt <= $maxRetries) {
-                    $this->logger->warning("HTTP request failed, retrying ({$attempt}/{$maxRetries})", [
-                        'url' => $file->getUrl(),
-                        'exception' => $exception->getMessage(),
-                    ]);
-                    usleep($retryDelay * 1000);
-                    continue;
+                $context = ['exception' => $exception->getMessage()];
+                if ($statusCode > 0) {
+                    $context['status_code'] = $statusCode;
                 }
-
-                throw $exception;
+                $this->backoffHttpRetry($file, 'GET', $attempt, $maxRetries, $retryDelay, $context);
+                continue;
             }
         }
 
-        // This is reached if maxRetries is 0 and first attempt fails without exception
         throw $lastException ?? FailedToRetrieveFileException::create('Failed to fetch remote file');
     }
 
@@ -1070,7 +1207,6 @@ class FileCache implements FileCacheContract
                 },
             ]);
 
-            // Check for HTTP errors (4xx, 5xx) since http_errors is disabled
             $statusCode = $response->getStatusCode();
             if ($statusCode >= 400) {
                 throw FailedToRetrieveFileException::create(
@@ -1119,7 +1255,6 @@ class FileCache implements FileCacheContract
         $path = $parts[1];
         $disk = $this->getDisk($file);
 
-        // Files from the local driver are not cached.
         $source = $disk->readStream($path);
         if (is_null($source)) {
             throw new FileNotFoundException("Could not open file stream for path: {$path}");
@@ -1128,7 +1263,6 @@ class FileCache implements FileCacheContract
         try {
             return $this->cacheFromResource($file, $source, $target);
         } finally {
-            // Always close the source stream
             if (is_resource($source)) {
                 fclose($source);
             }
@@ -1178,7 +1312,17 @@ class FileCache implements FileCacheContract
     protected function copyStreamWithSizeLimit($source, $target, int $maxBytes, bool $isUnlimitedSize, string $errorContext = ''): void
     {
         $readTimeout = $this->config['read_timeout'];
-        stream_set_timeout($source, $readTimeout < 0 ? 0 : (int) $readTimeout);
+        if ($readTimeout >= 0) {
+            $seconds = (int) floor($readTimeout);
+            $microseconds = (int) round(($readTimeout - $seconds) * 1_000_000);
+
+            if ($microseconds === 1_000_000) {
+                $seconds++;
+                $microseconds = 0;
+            }
+
+            stream_set_timeout($source, $seconds, $microseconds);
+        }
 
         $bytes = stream_copy_to_stream($source, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
 
@@ -1222,147 +1366,11 @@ class FileCache implements FileCacheContract
     protected function getDisk(File $file): FilesystemAdapter
     {
         $parts = $this->splitByProtocol($file->getUrl());
-        if (!isset($parts[0])) {
-            throw new RuntimeException("Invalid file URL format: {$file->getUrl()}");
-        }
-
         $diskName = $parts[0];
-        // Throws an exception if the disk does not exist.
         /** @var FilesystemAdapter $disk */
         $disk = $this->storage->disk($diskName);
 
         return $disk;
-    }
-
-    /**
-     * Prepare and validate configuration values.
-     *
-     * @throws InvalidConfigurationException
-     */
-    protected function prepareConfig(array $config): array
-    {
-        $fileCacheConfig = $this->loadLaravelConfig();
-        $config = [
-            'max_file_size' => -1, // any size (-1 = unlimited)
-            'max_age' => 60, // 1 hour in minutes
-            'max_size' => 1E+9, // 1 GB
-            'lock_max_attempts' => 3, // 3 attempts
-            'lock_wait_timeout' => -1, // indefinitely (-1 = no limit)
-            'timeout' => -1, // indefinitely (-1 = no limit)
-            'connect_timeout' => 30.0, // 30 seconds
-            'read_timeout' => 30.0, // 30 seconds
-            'prune_timeout' => 300, // 5 minutes
-            'mime_types' => [],
-            'allowed_hosts' => null, // null = all hosts allowed
-            'http_retries' => 0, // no retries by default
-            'http_retry_delay' => 100, // 100ms between retries
-            'lifecycle_lock_timeout' => 30.0, // 30 seconds (-1 = indefinitely)
-            'batch_chunk_size' => 100, // chunk size for batch operations
-            'path' => $this->getDefaultCachePath(),
-            ...$fileCacheConfig,
-            ...$config,
-        ];
-
-        // Convert values to appropriate types
-        $config['max_file_size'] = (int)$config['max_file_size'];
-        $config['max_age'] = (int)$config['max_age'];
-        $config['max_size'] = (int)$config['max_size'];
-        $config['lock_max_attempts'] = (int)$config['lock_max_attempts'];
-        $config['lock_wait_timeout'] = (float)$config['lock_wait_timeout'];
-        $config['timeout'] = (float)$config['timeout'];
-        $config['connect_timeout'] = (float)$config['connect_timeout'];
-        $config['read_timeout'] = (float)$config['read_timeout'];
-        $config['prune_timeout'] = (int)$config['prune_timeout'];
-        $config['http_retries'] = max((int)$config['http_retries'], 0);
-        $config['http_retry_delay'] = max((int)$config['http_retry_delay'], 0);
-        $config['lifecycle_lock_timeout'] = (float)$config['lifecycle_lock_timeout'];
-        $config['batch_chunk_size'] = (int)$config['batch_chunk_size'];
-
-        // Parse allowed_hosts from env string if needed
-        if (is_string($config['allowed_hosts']) && !empty($config['allowed_hosts'])) {
-            $config['allowed_hosts'] = array_map('trim', explode(',', $config['allowed_hosts']));
-        }
-
-        // Validate configuration values
-        $this->validateConfig($config);
-
-        return $config;
-    }
-
-    /**
-     * Validate configuration values.
-     *
-     * @throws InvalidConfigurationException
-     */
-    protected function validateConfig(array $config): void
-    {
-        if ($config['max_file_size'] < -1) {
-            throw InvalidConfigurationException::create('max_file_size', 'must be -1 (unlimited) or a positive number');
-        }
-
-        if ($config['max_age'] < 1) {
-            throw InvalidConfigurationException::create('max_age', 'must be at least 1 minute');
-        }
-
-        if ($config['max_size'] < 0) {
-            throw InvalidConfigurationException::create('max_size', 'must be 0 or a positive number');
-        }
-
-        if ($config['lock_max_attempts'] < 1) {
-            throw InvalidConfigurationException::create('lock_max_attempts', 'must be at least 1');
-        }
-
-        if ($config['lock_wait_timeout'] < -1) {
-            throw InvalidConfigurationException::create('lock_wait_timeout', 'must be -1 (indefinitely) or a non-negative number');
-        }
-
-        if ($config['timeout'] < -1) {
-            throw InvalidConfigurationException::create('timeout', 'must be -1 (indefinitely) or a non-negative number');
-        }
-
-        if ($config['connect_timeout'] < -1) {
-            throw InvalidConfigurationException::create('connect_timeout', 'must be -1 (indefinitely) or a non-negative number');
-        }
-
-        if ($config['read_timeout'] < -1) {
-            throw InvalidConfigurationException::create('read_timeout', 'must be -1 (indefinitely) or a non-negative number');
-        }
-
-        if ($config['prune_timeout'] < -1) {
-            throw InvalidConfigurationException::create('prune_timeout', 'must be -1 (no timeout) or a non-negative number');
-        }
-
-        if ($config['lifecycle_lock_timeout'] < -1) {
-            throw InvalidConfigurationException::create('lifecycle_lock_timeout', 'must be -1 (indefinitely) or a non-negative number');
-        }
-
-        if ($config['batch_chunk_size'] < -1 || $config['batch_chunk_size'] === 0) {
-            throw InvalidConfigurationException::create('batch_chunk_size', 'must be -1 (no limit) or a positive number');
-        }
-    }
-
-    /**
-     * Load configuration from Laravel's config system if available.
-     */
-    protected function loadLaravelConfig(): array
-    {
-        try {
-            return config('file-cache', []) ?: [];
-        } catch (\Throwable) {
-            return [];
-        }
-    }
-
-    /**
-     * Get the default cache path (Laravel storage or system temp).
-     */
-    protected function getDefaultCachePath(): string
-    {
-        try {
-            return storage_path('framework/cache/files');
-        } catch (\Throwable) {
-            return sys_get_temp_dir() . '/laravel-file-cache';
-        }
     }
 
     /**
@@ -1380,17 +1388,31 @@ class FileCache implements FileCacheContract
      */
     protected function isRemote(File $file): bool
     {
-        $url = $file->getUrl();
+        $scheme = parse_url($file->getUrl(), PHP_URL_SCHEME);
 
-        return str_starts_with($url, 'http://') || str_starts_with($url, 'https://');
+        if (!is_string($scheme)) {
+            return false;
+        }
+
+        $normalized = strtolower($scheme);
+
+        return $normalized === 'http' || $normalized === 'https';
     }
 
     /**
      * Split URL by protocol separator.
+     *
+     * @return array{0: string, 1?: string}
      */
     protected function splitByProtocol(string $url): array
     {
-        return explode('://', $url, 2);
+        $parts = explode('://', $url, 2);
+
+        if (isset($parts[1])) {
+            return [$parts[0], $parts[1]];
+        }
+
+        return [$parts[0]];
     }
 
     /**
@@ -1401,12 +1423,53 @@ class FileCache implements FileCacheContract
      */
     protected function encodeUrl(string $url): string
     {
-        // Characters to encode (space and other commonly problematic chars)
-        // Note: We don't encode + because it has meaning in URLs (especially query strings)
+        $parts = parse_url($url);
+        if ($parts === false || !isset($parts['scheme'], $parts['host'])) {
+            return $this->encodeUrlUnsafeCharacters($url);
+        }
+
+        $encoded = strtolower($parts['scheme']) . '://';
+
+        if (isset($parts['user'])) {
+            $encoded .= $this->encodeUrlUnsafeCharacters($parts['user']);
+            if (isset($parts['pass'])) {
+                $encoded .= ':' . $this->encodeUrlUnsafeCharacters($parts['pass']);
+            }
+            $encoded .= '@';
+        }
+
+        $host = $parts['host'];
+        if (str_contains($host, ':') && !str_starts_with($host, '[')) {
+            $host = '[' . $host . ']';
+        }
+        $encoded .= $host;
+
+        if (isset($parts['port'])) {
+            $encoded .= ':' . $parts['port'];
+        }
+
+        $encoded .= $this->encodeUrlUnsafeCharacters($parts['path'] ?? '');
+
+        if (isset($parts['query'])) {
+            $encoded .= '?' . $this->encodeUrlUnsafeCharacters($parts['query']);
+        }
+
+        if (isset($parts['fragment'])) {
+            $encoded .= '#' . $this->encodeUrlUnsafeCharacters($parts['fragment']);
+        }
+
+        return $encoded;
+    }
+
+    /**
+     * Encode unsafe URL characters in a single URL component.
+     */
+    protected function encodeUrlUnsafeCharacters(string $value): string
+    {
         $pattern = [' ', '[', ']', '{', '}', '"', '<', '>', '\\', '^', '`', '|'];
         $replacement = ['%20', '%5B', '%5D', '%7B', '%7D', '%22', '%3C', '%3E', '%5C', '%5E', '%60', '%7C'];
 
-        return str_replace($pattern, $replacement, $url);
+        return str_replace($pattern, $replacement, $value);
     }
 
     /**
@@ -1457,6 +1520,10 @@ class FileCache implements FileCacheContract
 
     /**
      * Default callback for batch() method.
+     *
+     * @param array<int, File> $files
+     * @param array<int, string> $paths
+     * @return array<int, string>
      */
     protected static function defaultBatchCallback(array $files, array $paths): array
     {
@@ -1468,8 +1535,6 @@ class FileCache implements FileCacheContract
      */
     protected function makeHttpClient(): Client
     {
-        // Guzzle uses 0 for no timeout, but we use -1 in config for clarity
-        // Convert -1 to 0 for Guzzle compatibility
         $timeout = max($this->config['timeout'], 0);
         $connectTimeout = max($this->config['connect_timeout'], 0);
         $readTimeout = max($this->config['read_timeout'], 0);

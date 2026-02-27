@@ -818,6 +818,34 @@ class FileCacheTest extends TestCase
         );
     }
 
+    public function testEncodeUrlPreservesIpv6HostBrackets()
+    {
+        $cache = new FileCache(['path' => $this->cachePath]);
+        $method = new ReflectionMethod(FileCache::class, 'encodeUrl');
+        $method->setAccessible(true);
+
+        $this->assertEquals(
+            'http://[::1]/path%5Bwith%5D/brackets.jpg',
+            $method->invoke($cache, 'http://[::1]/path[with]/brackets.jpg')
+        );
+    }
+
+    public function testExistsRemoteIpv6Host()
+    {
+        $file = new GenericFile('http://[::1]/file');
+        $cache = $this->createCacheWithMockClient([new Response(200)]);
+
+        $this->assertTrue($cache->exists($file));
+    }
+
+    public function testExistsRemoteUppercaseScheme()
+    {
+        $file = new GenericFile('HTTPS://example.com/file');
+        $cache = $this->createCacheWithMockClient([new Response(200)]);
+
+        $this->assertTrue($cache->exists($file));
+    }
+
     public function testBatchChunking()
     {
         $this->app['files']->put("{$this->diskPath}/test-image.jpg", 'abc');

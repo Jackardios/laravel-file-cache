@@ -2,6 +2,7 @@
 
 namespace Jackardios\FileCache;
 
+use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
 use Jackardios\FileCache\Console\Commands\PruneFileCache;
 use Jackardios\FileCache\Listeners\ClearFileCache;
 use Illuminate\Console\Scheduling\Schedule;
@@ -19,8 +20,6 @@ class FileCacheServiceProvider extends ServiceProvider
             __DIR__.'/config/file-cache.php' => base_path('config/file-cache.php'),
         ], 'config');
 
-        // Wait for Laravel to boot before adding the scheduled event.
-        // See: https://stackoverflow.com/a/36630136/1796523
         $this->app->booted([$this, 'registerScheduledPruneCommand']);
 
         $events->listen('cache:clearing', ClearFileCache::class);
@@ -34,8 +33,14 @@ class FileCacheServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__.'/config/file-cache.php', 'file-cache');
 
         $this->app->singleton('file-cache', function ($app) {
-            return new FileCache($app['config']['file-cache'] ?? []);
+            $config = $app['config']['file-cache'] ?? [];
+            if (!is_array($config)) {
+                $config = [];
+            }
+
+            return new FileCache($config);
         });
+        $this->app->alias('file-cache', FileCacheContract::class);
 
         $this->app->singleton('command.file-cache.prune', function ($app) {
             return new PruneFileCache;
@@ -45,6 +50,8 @@ class FileCacheServiceProvider extends ServiceProvider
 
     /**
      * Get the services provided by the provider.
+     *
+     * @return array<int, string>
      */
     public function provides(): array
     {
@@ -59,8 +66,13 @@ class FileCacheServiceProvider extends ServiceProvider
      */
     public function registerScheduledPruneCommand(): void
     {
+        $expression = config('file-cache.prune_interval', '*/5 * * * *');
+        if (!is_string($expression) || $expression === '') {
+            $expression = '*/5 * * * *';
+        }
+
         $this->app->make(Schedule::class)
             ->command(PruneFileCache::class)
-            ->cron(config('file-cache.prune_interval'));
+            ->cron($expression);
     }
 }

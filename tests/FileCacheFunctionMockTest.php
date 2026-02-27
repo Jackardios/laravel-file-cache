@@ -139,6 +139,40 @@ class FileCacheFunctionMockTest extends TestCase
         return "{$this->cachePath}/" . hash('sha256', $url);
     }
 
+    public function testGetWithUnlimitedReadTimeoutDoesNotForceZeroSecondStreamTimeout()
+    {
+        $url = 'fixtures://test-file.txt';
+        $file = new GenericFile($url);
+        $cachedPath = $this->getCachedPath($url);
+
+        $cache = $this->createCacheWithMockFixtures(['read_timeout' => -1]);
+
+        $streamSetTimeoutMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_set_timeout');
+        $streamSetTimeoutMock->expects($this->never());
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertEquals($cachedPath, $path);
+        $this->assertFileExists($cachedPath);
+    }
+
+    public function testGetPreservesFractionalReadTimeoutPrecision()
+    {
+        $cache = $this->createCacheWithMockFixtures(['read_timeout' => 0.5]);
+        $file = new GenericFile('fixtures://test-file.txt');
+
+        $streamSetTimeoutMock = $this->getFunctionMock('Jackardios\\FileCache', 'stream_set_timeout');
+        $streamSetTimeoutMock->expects($this->once())
+            ->willReturnCallback(function ($stream, $seconds, $microseconds = 0) {
+                $this->assertIsResource($stream);
+                $this->assertSame(0, $seconds);
+                $this->assertSame(500000, $microseconds);
+                return true;
+            });
+
+        $path = $cache->get($file, $this->noop);
+        $this->assertFileExists($path);
+    }
+
     public function testGetDiskThrowsSourceResourceTimeoutException()
     {
         $url = 's3://files/test-image.jpg';

@@ -26,7 +26,6 @@ class GenericFile implements File
             throw new InvalidArgumentException('File URL cannot be empty');
         }
 
-        // URL must contain a protocol separator
         if (!str_contains($url, '://')) {
             throw new InvalidArgumentException('File URL must contain a protocol (e.g., http://, https://, or diskname://)');
         }

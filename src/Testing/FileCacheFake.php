@@ -84,7 +84,6 @@ class FileCacheFake implements FileCacheContract
      */
     public function clear(): void
     {
-        //
     }
 
     /**
