@@ -11,8 +11,10 @@ use Illuminate\Support\Facades\Facade;
  * @method static mixed getOnce(\Jackardios\FileCache\Contracts\File $file, ?callable $callback = null, bool $throwOnLock = false)
  * @method static mixed batch(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null, bool $throwOnLock = false)
  * @method static mixed batchOnce(\Jackardios\FileCache\Contracts\File[] $files, ?callable $callback = null, bool $throwOnLock = false)
+ * @method static bool forget(\Jackardios\FileCache\Contracts\File $file)
  * @method static array prune()
  * @method static void clear()
+ * @method static \Jackardios\FileCache\Support\CacheMetrics metrics()
  *
  * @see \Jackardios\FileCache\FileCache;
  */

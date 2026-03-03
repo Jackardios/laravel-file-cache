@@ -70,7 +70,7 @@ interface FileCache
      *
      * @throws \RuntimeException
      *
-     * @return array{deleted: int, remaining: int, total_size: int} Statistics about pruning operation
+     * @return array{deleted: int, remaining: int, total_size: int, completed: bool} Statistics about pruning operation
      */
     public function prune(): array;
 
@@ -80,6 +80,15 @@ interface FileCache
      * @throws \RuntimeException
      */
     public function clear(): void;
+
+    /**
+     * Remove a specific file from the cache.
+     *
+     * @param \Jackardios\FileCache\Contracts\File $file
+     *
+     * @return bool True if the file was deleted, false if it didn't exist or is locked.
+     */
+    public function forget(File $file): bool;
 
     /**
      * Check if a file exists.

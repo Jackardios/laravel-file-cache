@@ -12,7 +12,14 @@ use Jackardios\FileCache\Exceptions\HostNotAllowedException;
 use Jackardios\FileCache\Exceptions\MimeTypeIsNotAllowedException;
 use Jackardios\FileCache\Exceptions\SourceResourceIsInvalidException;
 use Jackardios\FileCache\Exceptions\SourceResourceTimedOutException;
+use Jackardios\FileCache\Events\CacheFileEvicted;
+use Jackardios\FileCache\Events\CacheFileRetrieved;
+use Jackardios\FileCache\Events\CacheHit;
+use Jackardios\FileCache\Events\CacheMiss;
+use Jackardios\FileCache\Events\CachePruneCompleted;
+use Jackardios\FileCache\Support\CacheMetrics;
 use Jackardios\FileCache\Support\ConfigNormalizer;
+use Illuminate\Contracts\Events\Dispatcher;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Exception;
@@ -30,25 +37,8 @@ use Symfony\Component\Finder\Finder;
 /**
  * The file cache.
  *
+ * @phpstan-import-type NormalizedConfig from ConfigNormalizer
  * @phpstan-type RetrievedFile array{path: string, stream: resource}
- * @phpstan-type NormalizedConfig array{
- *   max_file_size: int,
- *   max_age: int,
- *   max_size: int,
- *   lock_max_attempts: int,
- *   lock_wait_timeout: float,
- *   timeout: float,
- *   connect_timeout: float,
- *   read_timeout: float,
- *   prune_timeout: int,
- *   mime_types: array<int, string>,
- *   allowed_hosts: array<int, string>|null,
- *   http_retries: int,
- *   http_retry_delay: int,
- *   lifecycle_lock_timeout: float,
- *   batch_chunk_size: int,
- *   path: string
- * }
  */
 class FileCache implements FileCacheContract
 {
@@ -78,6 +68,23 @@ class FileCache implements FileCacheContract
     protected LoggerInterface $logger;
 
     /**
+     * Event dispatcher for cache events.
+     */
+    protected ?Dispatcher $dispatcher;
+
+    /**
+     * In-process cache metrics.
+     */
+    protected CacheMetrics $metrics;
+
+    /**
+     * In-memory cache of URL→path mappings.
+     *
+     * @var array<string, string>
+     */
+    protected array $pathCache = [];
+
+    /**
      * Create an instance.
      *
      * @param array<string, mixed> $config
@@ -87,13 +94,18 @@ class FileCache implements FileCacheContract
         ?Client $client = null,
         ?Filesystem $files = null,
         ?FilesystemManager $storage = null,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?Dispatcher $dispatcher = null
     ) {
         $this->config = ConfigNormalizer::normalize($config);
         $this->client = $client ?? $this->makeHttpClient();
         $this->files = $files ?? $this->resolveFilesystem();
         $this->storage = $storage ?? $this->resolveFilesystemManager();
         $this->logger = $logger ?: new NullLogger();
+        $this->dispatcher = $this->config['events_enabled']
+            ? ($dispatcher ?? $this->resolveEventDispatcher())
+            : null;
+        $this->metrics = new CacheMetrics();
     }
 
     protected function resolveFilesystem(): Filesystem
@@ -114,6 +126,41 @@ class FileCache implements FileCacheContract
         }
 
         return $filesystem;
+    }
+
+    protected function resolveEventDispatcher(): ?Dispatcher
+    {
+        try {
+            $dispatcher = app(Dispatcher::class);
+            return $dispatcher instanceof Dispatcher ? $dispatcher : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Get the in-process cache metrics.
+     */
+    public function metrics(): CacheMetrics
+    {
+        return $this->metrics;
+    }
+
+    /**
+     * Remove a specific file from the cache.
+     *
+     * @param File $file The file to remove from cache
+     * @return bool True if the file was deleted, false if it didn't exist or is locked
+     */
+    public function forget(File $file): bool
+    {
+        $cachedPath = $this->getCachedPath($file);
+
+        if (!$this->files->exists($cachedPath)) {
+            return false;
+        }
+
+        return $this->delete(new SplFileInfo($cachedPath));
     }
 
     /**
@@ -373,13 +420,13 @@ class FileCache implements FileCacheContract
     /**
      * {@inheritdoc}
      *
-     * @return array{deleted: int, remaining: int, total_size: int} Statistics about pruning operation
+     * @return array{deleted: int, remaining: int, total_size: int, completed: bool} Statistics about pruning operation
      */
     public function prune(): array
     {
-        /** @var array{deleted: int, remaining: int, total_size: int} $stats */
-        $stats = $this->withLifecycleExclusiveLock(function (): array {
-            $stats = ['deleted' => 0, 'remaining' => 0, 'total_size' => 0];
+        /** @var array{deleted: int, remaining: int, total_size: int, completed: bool} $stats */
+        $stats = $this->withLifecycleSharedLock(function (): array {
+            $stats = ['deleted' => 0, 'remaining' => 0, 'total_size' => 0, 'completed' => true];
 
             if (!$this->files->exists($this->config['path'])) {
                 return $stats;
@@ -401,6 +448,7 @@ class FileCache implements FileCacheContract
             foreach ($files as $file) {
                 if ($this->isPruneTimedOut($startTime, $timeout, 'file collection')) {
                     $this->logger->warning('Prune operation timed out during file collection');
+                    $stats['completed'] = false;
                     return $stats;
                 }
 
@@ -423,12 +471,13 @@ class FileCache implements FileCacheContract
 
             foreach ($fileInfos as $info) {
                 if ($this->isPruneTimedOut($startTime, $timeout, 'age-based pruning')) {
+                    $stats['completed'] = false;
                     return $stats;
                 }
 
                 $isExpired = ($now - $info['atime']) > $allowedAge;
 
-                if ($isExpired && $this->delete($info['file'])) {
+                if ($isExpired && $this->delete($info['file'], 'pruned_age')) {
                     $stats['deleted']++;
                     continue;
                 }
@@ -445,10 +494,11 @@ class FileCache implements FileCacheContract
                     }
 
                     if ($this->isPruneTimedOut($startTime, $timeout, 'size-based pruning', $totalSize - $allowedSize)) {
+                        $stats['completed'] = false;
                         break;
                     }
 
-                    if ($this->delete($info['file'])) {
+                    if ($this->delete($info['file'], 'pruned_size')) {
                         $totalSize -= $info['size'];
                         $stats['deleted']++;
                         $remainingCount--;
@@ -461,6 +511,15 @@ class FileCache implements FileCacheContract
 
             return $stats;
         });
+
+        if ($this->dispatcher !== null) {
+            $this->dispatcher->dispatch(new CachePruneCompleted(
+                $stats['deleted'],
+                $stats['remaining'],
+                $stats['total_size'],
+                $stats['completed']
+            ));
+        }
 
         return $stats;
     }
@@ -515,7 +574,7 @@ class FileCache implements FileCacheContract
                 ->getIterator();
 
             foreach ($files as $file) {
-                $this->delete($file);
+                $this->delete($file, 'cleared');
             }
         });
     }
@@ -567,7 +626,7 @@ class FileCache implements FileCacheContract
                 );
             }
 
-            usleep(50000); // 50ms
+            usleep(random_int(30000, 70000)); // ~50ms with jitter
         }
 
         try {
@@ -648,6 +707,10 @@ class FileCache implements FileCacheContract
             try {
                 if (flock($handle, LOCK_EX | LOCK_NB)) {
                     $this->files->delete($path);
+                    $this->metrics->evictions++;
+                    if ($this->dispatcher !== null) {
+                        $this->dispatcher->dispatch(new CacheFileEvicted($path, 'once'));
+                    }
                 }
             } finally {
                 fclose($handle);
@@ -708,7 +771,9 @@ class FileCache implements FileCacheContract
             ...$context,
         ]);
 
-        usleep($retryDelay * 1000);
+        $delay = (int) min($retryDelay * pow(2, $attempt - 1), 30000);
+        $actual = random_int((int) ($delay * 0.5), (int) ($delay * 1.5));
+        usleep($actual * 1000);
     }
 
     /**
@@ -850,7 +915,7 @@ class FileCache implements FileCacheContract
      *
      * @return bool If the file has been deleted.
      */
-    protected function delete(SplFileInfo $file): bool
+    protected function delete(SplFileInfo $file, string $evictionReason = 'pruned'): bool
     {
         $fileStream = null;
         $deleted = false;
@@ -869,6 +934,10 @@ class FileCache implements FileCacheContract
             if (flock($fileStream, LOCK_EX | LOCK_NB)) {
                 $this->files->delete($filePath);
                 $deleted = true;
+                $this->metrics->evictions++;
+                if ($this->dispatcher !== null) {
+                    $this->dispatcher->dispatch(new CacheFileEvicted($filePath, $evictionReason));
+                }
             }
         } catch (Exception $e) {
             return false;
@@ -915,12 +984,13 @@ class FileCache implements FileCacheContract
                 continue;
             }
 
-            $existingRetrieved = $this->retrieveFromExistingCache($cachedPath, $throwOnLock);
+            $existingRetrieved = $this->retrieveFromExistingCache($file, $cachedPath, $throwOnLock);
             if ($existingRetrieved !== null) {
                 return $existingRetrieved;
             }
         }
 
+        $this->metrics->errors++;
         throw FailedToRetrieveFileException::create("Failed to retrieve file after {$this->config['lock_max_attempts']} attempts");
     }
 
@@ -929,12 +999,12 @@ class FileCache implements FileCacheContract
      *
      * @return RetrievedFile|null
      */
-    protected function retrieveFromExistingCache(string $cachedPath, bool $throwOnLock): ?array
+    protected function retrieveFromExistingCache(File $file, string $cachedPath, bool $throwOnLock): ?array
     {
         $cachedFileStream = @fopen($cachedPath, 'rb');
 
         if ($cachedFileStream === false) {
-            usleep(100000); // 100ms
+            usleep(random_int(70000, 130000)); // ~100ms with jitter
             return null;
         }
 
@@ -962,7 +1032,7 @@ class FileCache implements FileCacheContract
             }
 
             $closeStream = false;
-            return $this->retrieveExistingFile($cachedPath, $cachedFileStream);
+            return $this->retrieveExistingFile($cachedPath, $cachedFileStream, $file, $stat);
         } finally {
             if ($closeStream && is_resource($cachedFileStream)) {
                 fclose($cachedFileStream);
@@ -996,7 +1066,7 @@ class FileCache implements FileCacheContract
             }
 
             if (!$lockAcquired) {
-                usleep(50000); // 50ms
+                usleep(random_int(30000, 70000)); // ~50ms with jitter
             }
         }
 
@@ -1035,16 +1105,30 @@ class FileCache implements FileCacheContract
      *
      * @param string $cachedPath
      * @param resource $cachedFileStream
+     * @param File|null $file The file object, used for events/metrics
+     * @param array<string, mixed>|null $stat File stat array from fstat(), used for touch throttling
      *
      * @return RetrievedFile
      */
-    protected function retrieveExistingFile(string $cachedPath, $cachedFileStream): array
+    protected function retrieveExistingFile(string $cachedPath, $cachedFileStream, ?File $file = null, ?array $stat = null): array
     {
-        if (!@touch($cachedPath)) {
+        $touchInterval = $this->config['touch_interval'];
+        $shouldTouch = true;
+
+        if ($touchInterval > 0 && is_array($stat) && isset($stat['atime'])) {
+            $shouldTouch = (time() - $stat['atime']) >= $touchInterval;
+        }
+
+        if ($shouldTouch && !@touch($cachedPath)) {
             $this->logger->warning('Failed to update access time for cached file', [
                 'path' => $cachedPath,
                 'error' => error_get_last()['message'] ?? 'Unknown error',
             ]);
+        }
+
+        $this->metrics->hits++;
+        if ($file !== null && $this->dispatcher !== null) {
+            $this->dispatcher->dispatch(new CacheHit($file, $cachedPath));
         }
 
         return [
@@ -1071,7 +1155,13 @@ class FileCache implements FileCacheContract
      */
     protected function retrieveNewFile(File $file, string $cachedPath, $cachedFileStream): array
     {
-        if ($this->isRemote($file)) {
+        $source = $this->isRemote($file) ? 'remote' : 'disk';
+        $this->metrics->misses++;
+        if ($this->dispatcher !== null) {
+            $this->dispatcher->dispatch(new CacheMiss($file, $file->getUrl()));
+        }
+
+        if ($source === 'remote') {
             $cachedPath = $this->getRemoteFile($file, $cachedFileStream);
         } else {
             $newCachedPath = $this->getDiskFile($file, $cachedFileStream);
@@ -1091,6 +1181,12 @@ class FileCache implements FileCacheContract
             if (!in_array($type, $this->config['mime_types'], true)) {
                 throw MimeTypeIsNotAllowedException::create($type);
             }
+        }
+
+        $this->metrics->retrievals++;
+        if ($this->dispatcher !== null) {
+            $bytes = @filesize($cachedPath);
+            $this->dispatcher->dispatch(new CacheFileRetrieved($file, $cachedPath, $bytes ?: 0, $source));
         }
 
         return [
@@ -1324,7 +1420,8 @@ class FileCache implements FileCacheContract
             stream_set_timeout($source, $seconds, $microseconds);
         }
 
-        $bytes = stream_copy_to_stream($source, $target, $isUnlimitedSize ? -1 : $maxBytes + 1);
+        $limit = $isUnlimitedSize ? -1 : ($maxBytes < PHP_INT_MAX ? $maxBytes + 1 : -1);
+        $bytes = stream_copy_to_stream($source, $target, $limit);
 
         if ($bytes === false) {
             /** @var array<string, mixed> $metadata */
@@ -1355,9 +1452,9 @@ class FileCache implements FileCacheContract
      */
     protected function getCachedPath(File $file): string
     {
-        $hash = hash('sha256', $file->getUrl());
+        $url = $file->getUrl();
 
-        return "{$this->config['path']}/{$hash}";
+        return $this->pathCache[$url] ??= "{$this->config['path']}/" . hash('sha256', $url);
     }
 
     /**
@@ -1466,10 +1563,11 @@ class FileCache implements FileCacheContract
      */
     protected function encodeUrlUnsafeCharacters(string $value): string
     {
-        $pattern = [' ', '[', ']', '{', '}', '"', '<', '>', '\\', '^', '`', '|'];
-        $replacement = ['%20', '%5B', '%5D', '%7B', '%7D', '%22', '%3C', '%3E', '%5C', '%5E', '%60', '%7C'];
-
-        return str_replace($pattern, $replacement, $value);
+        return preg_replace_callback(
+            '/[^A-Za-z0-9\-._~:@!$&\'()*+,;=%\/?#]/',
+            static fn(array $m): string => rawurlencode($m[0]),
+            $value
+        ) ?? $value;
     }
 
     /**
@@ -1544,6 +1642,12 @@ class FileCache implements FileCacheContract
             'connect_timeout' => $connectTimeout,
             'read_timeout' => $readTimeout,
             'http_errors' => false,
+            'headers' => [
+                'User-Agent' => $this->config['user_agent'],
+            ],
+            'allow_redirects' => [
+                'max' => $this->config['max_redirects'],
+            ],
         ]);
     }
 }

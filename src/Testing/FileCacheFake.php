@@ -5,11 +5,14 @@ namespace Jackardios\FileCache\Testing;
 use Illuminate\Contracts\Foundation\Application;
 use Jackardios\FileCache\Contracts\File;
 use Jackardios\FileCache\Contracts\FileCache as FileCacheContract;
+use Jackardios\FileCache\Support\CacheMetrics;
 use Illuminate\Filesystem\Filesystem;
 
 class FileCacheFake implements FileCacheContract
 {
     protected string $path;
+
+    protected CacheMetrics $metrics;
 
     /**
      * Create a new fake file cache instance.
@@ -25,6 +28,15 @@ class FileCacheFake implements FileCacheContract
         );
 
         $this->path = $root;
+        $this->metrics = new CacheMetrics();
+    }
+
+    /**
+     * Get the in-process cache metrics.
+     */
+    public function metrics(): CacheMetrics
+    {
+        return $this->metrics;
     }
 
     /**
@@ -76,7 +88,7 @@ class FileCacheFake implements FileCacheContract
      */
     public function prune(): array
     {
-        return ['deleted' => 0, 'remaining' => 0, 'total_size' => 0];
+        return ['deleted' => 0, 'remaining' => 0, 'total_size' => 0, 'completed' => true];
     }
 
     /**
@@ -84,6 +96,21 @@ class FileCacheFake implements FileCacheContract
      */
     public function clear(): void
     {
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function forget(File $file): bool
+    {
+        $hash = hash('sha256', $file->getUrl());
+        $path = "{$this->path}/{$hash}";
+
+        if (!file_exists($path)) {
+            return false;
+        }
+
+        return @unlink($path);
     }
 
     /**

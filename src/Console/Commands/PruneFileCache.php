@@ -29,7 +29,11 @@ class PruneFileCache extends Command
         $stats = $cache->prune();
 
         if (!$this->option('silent')) {
-            $this->info('File cache pruned successfully.');
+            if (!($stats['completed'] ?? true)) {
+                $this->warn('Prune operation did not complete (timed out).');
+            } else {
+                $this->info('File cache pruned successfully.');
+            }
             $this->line("  Deleted: {$stats['deleted']} files");
             $this->line("  Remaining: {$stats['remaining']} files");
             $this->line("  Total size: " . $this->formatBytes($stats['total_size']));

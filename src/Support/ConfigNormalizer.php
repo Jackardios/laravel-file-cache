@@ -23,7 +23,11 @@ use Jackardios\FileCache\Exceptions\InvalidConfigurationException;
  *   http_retry_delay: int,
  *   lifecycle_lock_timeout: float,
  *   batch_chunk_size: int,
- *   path: string
+ *   path: string,
+ *   user_agent: string,
+ *   max_redirects: int,
+ *   touch_interval: int,
+ *   events_enabled: bool
  * }
  */
 final class ConfigNormalizer
@@ -49,9 +53,13 @@ final class ConfigNormalizer
             'mime_types' => [],
             'allowed_hosts' => null, // null = all hosts allowed
             'http_retries' => 0, // no retries by default
-            'http_retry_delay' => 100, // 100ms between retries
+            'http_retry_delay' => 100, // 100ms base delay for retries (exponential backoff)
             'lifecycle_lock_timeout' => 30.0, // 30 seconds (-1 = indefinitely)
             'batch_chunk_size' => 100, // chunk size for batch operations
+            'user_agent' => 'Laravel-FileCache/4.x',
+            'max_redirects' => 5,
+            'touch_interval' => 60, // seconds between touch() calls
+            'events_enabled' => false,
             'path' => self::defaultCachePath(),
             ...self::loadLaravelConfig(),
             ...$config,
@@ -73,6 +81,10 @@ final class ConfigNormalizer
             'http_retry_delay' => max(self::toInt($merged['http_retry_delay']), 0),
             'lifecycle_lock_timeout' => self::toFloat($merged['lifecycle_lock_timeout']),
             'batch_chunk_size' => self::toInt($merged['batch_chunk_size']),
+            'user_agent' => self::toString($merged['user_agent']),
+            'max_redirects' => max(self::toInt($merged['max_redirects']), 0),
+            'touch_interval' => max(self::toInt($merged['touch_interval']), 0),
+            'events_enabled' => (bool) $merged['events_enabled'],
             'path' => self::toString($merged['path']),
         ];
 
@@ -240,7 +252,7 @@ final class ConfigNormalizer
 
         if (is_string($allowedHosts)) {
             if ($allowedHosts === '') {
-                return [''];
+                return null;
             }
 
             return array_values(array_map('trim', explode(',', $allowedHosts)));

@@ -118,4 +118,31 @@ return [
      */
     'batch_chunk_size' => env('FILE_CACHE_BATCH_CHUNK_SIZE', 100),
 
+    /*
+     | User-Agent header sent with HTTP requests to remote servers.
+     | Default: 'Laravel-FileCache/4.x'
+     */
+    'user_agent' => env('FILE_CACHE_USER_AGENT', 'Laravel-FileCache/4.x'),
+
+    /*
+     | Maximum number of HTTP redirects to follow.
+     | Default: 5
+     */
+    'max_redirects' => env('FILE_CACHE_MAX_REDIRECTS', 5),
+
+    /*
+     | Minimum interval in seconds between touch() calls on cached files.
+     | Reduces filesystem writes on frequently accessed files.
+     | Set to 0 to touch on every access.
+     | Default: 60 seconds
+     */
+    'touch_interval' => env('FILE_CACHE_TOUCH_INTERVAL', 60),
+
+    /*
+     | Enable dispatching of cache events (CacheHit, CacheMiss, etc.).
+     | When disabled, no events are dispatched (zero overhead).
+     | Default: false
+     */
+    'events_enabled' => env('FILE_CACHE_EVENTS_ENABLED', false),
+
 ];
